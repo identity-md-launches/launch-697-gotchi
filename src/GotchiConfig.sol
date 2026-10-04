@@ -31,14 +31,23 @@ library GotchiConfig {
     /// @notice Fixed $GOTCHI supply (18 decimals). Fixed by the launch token rules, not configurable.
     uint256 internal constant TOKEN_SUPPLY = 1_000_000_000e18;
 
+    /// @notice Purchase band of FeeSink: it never pays more than this for one NFT, whatever it holds.
+    /// @dev Five thresholds. Bounds what a single listing can take out of the accumulated fees.
+    uint256 internal constant MAX_BUY_PRICE = 0.05 ether;
+
+    /// @notice Lowest price MockBaazaar accepts for a listing and FeeSink pays for one NFT.
+    /// @dev A tenth of the threshold, so one threshold of fees funds at most ten purchases.
+    uint256 internal constant MIN_LIST_PRICE = 0.001 ether;
+
     /// @notice Configurable: ETH the operator seeds the forever pool with.
-    uint256 internal constant INITIAL_LIQUIDITY_ETH = 1 ether;
+    uint256 internal constant INITIAL_LIQUIDITY_ETH = 0.1 ether;
 
     /// @notice Configurable: $GOTCHI the operator seeds the forever pool with.
     /// @dev Implied opening price = INITIAL_LIQUIDITY_ETH / INITIAL_LIQUIDITY_TOKENS per token, so the
     /// implied fully-diluted market cap is TOKEN_SUPPLY * INITIAL_LIQUIDITY_ETH / INITIAL_LIQUIDITY_TOKENS
-    /// = 2 ETH with the defaults.
-    uint256 internal constant INITIAL_LIQUIDITY_TOKENS = 500_000_000e18;
+    /// = 2 ETH with the defaults. Sized to half of the 100,000,000 $GOTCHI (10% of supply) a requester
+    /// wallet holds after a default factory launch, so SeedPool can run without changing the split.
+    uint256 internal constant INITIAL_LIQUIDITY_TOKENS = 50_000_000e18;
 
     /// @notice LP fee of the forever pool (pips). 0: the locked position earns nothing, the hook fee is the
     /// only fee a swapper pays. Configurable.
@@ -51,13 +60,22 @@ library GotchiConfig {
     uint256 internal constant MIN_ENROLL_BALANCE = 1_000e18;
 
     /// @notice Upper bound on enrolled holders so a snapshot fits comfortably in one transaction.
+    /// @dev When the registry is full a larger holder displaces the smallest entry, so the cap selects
+    /// the largest opted-in holders instead of the first ones.
     uint256 internal constant MAX_HOLDERS = 128;
 
+    /// @notice Blocks a holder's recorded weight must have been in place before an NFT purchase for it
+    /// to count in that purchase's flip (about one hour on Sepolia). Configurable.
+    uint256 internal constant ENROLL_MATURITY_BLOCKS = 300;
+
     /// @notice Upper bound on simultaneously active mock listings so `cheapest()` is bounded.
+    /// @dev When the market is full a strictly cheaper listing evicts the most expensive one.
     uint256 internal constant MAX_ACTIVE_LISTINGS = 64;
 
     /// @notice Gas forwarded by the hook to FeeSink.tryBuy() inside afterSwap. Bounds the swapper's cost.
-    uint256 internal constant TRIGGER_GAS = 700_000;
+    /// @dev Sized for a full market: tryBuy with MAX_ACTIVE_LISTINGS listings is measured in
+    /// test/GotchiFeeHook.t.sol and must stay well under this.
+    uint256 internal constant TRIGGER_GAS = 1_000_000;
 
     /// @notice Blocks after the commit block before a reveal is accepted (entropy block = commit + 1).
     uint256 internal constant REVEAL_DELAY_BLOCKS = 2;

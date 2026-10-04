@@ -5,7 +5,8 @@ import {ERC721} from "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 
 /// @title MockGotchiNFT
 /// @notice A stand-in for Aavegotchi ERC-721s on Sepolia. Anyone can mint; that is the point of a mock.
-/// @dev Real Aavegotchi / Diamond integration is a README TODO. Nothing in the system trusts minting.
+/// @dev Real Aavegotchi / Diamond integration is a README TODO. Minting is free, so a mock NFT carries
+/// no value: FeeSink still pays ETH for listed mocks, bounded per purchase by its price band.
 contract MockGotchiNFT is ERC721 {
     /// @notice Next token id to mint (ids start at 1).
     uint256 public nextTokenId = 1;

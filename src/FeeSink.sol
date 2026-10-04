@@ -15,11 +15,20 @@ import {GotchiConfig} from "./GotchiConfig.sol";
 /// @dev Reentrancy: `tryBuy` is `nonReentrant`, follows checks-effects-interactions, and the only
 /// ETH-bearing call it makes is to the immutable market. `receive()` only accounts. There is no sweep,
 /// withdraw or treasury: every wei that arrives is spent on listings or waits for the next one.
+/// Price band: one purchase pays at least MIN_BUY_PRICE and at most MAX_BUY_PRICE, whatever the sink
+/// holds, so a single listing can never absorb the accumulated fees and dust listings are never bought.
+/// The cheapest listing being outside the band is a no-op, exactly like an empty market.
 /// Roles: `owner` (Ownable2Step) wires the hook once and may trigger `tryBuy`; the hook triggers `tryBuy`
 /// after every swap. Nothing else is privileged.
 contract FeeSink is IFeeSink, IGotchiEvents, Ownable2Step, ReentrancyGuard {
     /// @notice Purchases start once the balance reaches this.
     uint256 public constant MIN_BUY_THRESHOLD = GotchiConfig.MIN_BUY_THRESHOLD;
+
+    /// @notice The most the sink pays for one NFT.
+    uint256 public constant MAX_BUY_PRICE = GotchiConfig.MAX_BUY_PRICE;
+
+    /// @notice The least the sink pays for one NFT.
+    uint256 public constant MIN_BUY_PRICE = GotchiConfig.MIN_LIST_PRICE;
 
     IMockBaazaar public immutable MARKET;
     IFlipEscrow public immutable ESCROW;
@@ -72,7 +81,7 @@ contract FeeSink is IFeeSink, IGotchiEvents, Ownable2Step, ReentrancyGuard {
         uint256 balance = address(this).balance;
         if (balance < MIN_BUY_THRESHOLD) return false;
         IMockBaazaar.Listing memory cheapest = MARKET.cheapest();
-        if (!cheapest.active || cheapest.price > balance) return false;
+        if (!cheapest.active || !_affordable(cheapest.price, balance)) return false;
 
         buyCount += 1;
         totalSpent += cheapest.price;
@@ -88,6 +97,11 @@ contract FeeSink is IFeeSink, IGotchiEvents, Ownable2Step, ReentrancyGuard {
     function pendingBuy() external view returns (bool possible, IMockBaazaar.Listing memory cheapest) {
         uint256 balance = address(this).balance;
         cheapest = MARKET.cheapest();
-        possible = balance >= MIN_BUY_THRESHOLD && cheapest.active && cheapest.price <= balance;
+        possible = balance >= MIN_BUY_THRESHOLD && cheapest.active && _affordable(cheapest.price, balance);
+    }
+
+    /// @dev Inside the price band and covered by the balance.
+    function _affordable(uint256 price, uint256 balance) private pure returns (bool) {
+        return price >= MIN_BUY_PRICE && price <= MAX_BUY_PRICE && price <= balance;
     }
 }

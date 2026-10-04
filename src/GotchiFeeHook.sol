@@ -25,8 +25,22 @@ import {GotchiConfig} from "./GotchiConfig.sol";
 ///    specified delta of `fee` and takes it from the PoolManager straight to FeeSink.
 ///  - ETH is the unspecified currency (token exact-in, or token exact-out): afterSwap reads the ETH
 ///    amount from the swap delta, returns `fee` as the hook's unspecified delta and takes it.
-/// Either way the swapper pays or receives exactly FEE_BPS less ETH than they would have, and the ETH
-/// moves PoolManager -> FeeSink by `take` (no ETH ever sits in the hook). afterSwap then pokes
+/// The ETH moves PoolManager -> FeeSink by `take` (no ETH ever sits in the hook).
+///
+/// Partial fills. v4 stops a swap at `sqrtPriceLimitX96`. When ETH is the unspecified currency the fee
+/// is sized from the realised ETH amount, so a partial fill pays FEE_BPS of what actually moved. When
+/// ETH is the specified currency the fee was sized from the request in beforeSwap, and v4 gives a hook
+/// no way to hand part of a specified-currency delta back afterwards, so afterSwap REVERTS
+/// (`PartialFillUnsupported`) unless the pool swapped exactly the requested amount net of the fee. An
+/// ETH-specified swap therefore fills completely or not at all, and the fee is always FEE_BPS of the
+/// ETH that moved. Routers that bound slippage with amount limits (the usual way) are unaffected.
+///
+/// Fee basis. The fee is FEE_BPS of the amount named in the swap for ETH-specified swaps and FEE_BPS of
+/// the pool's ETH leg otherwise. So ETH exact-in and token exact-in pay 30 bps of the gross ETH, while
+/// ETH exact-out pays 30 bps of the net ETH received and token exact-out pays 30 bps on top of the
+/// pool's ETH input (both 29.91 bps of the gross). FeesCollected amounts follow that per-shape basis.
+///
+/// afterSwap then pokes
 /// FeeSink.tryBuy() with a bounded gas stipend inside try/catch so a purchase, a full market or a
 /// reverting sink can never make a swap fail.
 ///
@@ -61,6 +75,7 @@ contract GotchiFeeHook is IHooks, IGotchiEvents {
     error ZeroAddress();
     error AlreadyWired();
     error HookNotImplemented();
+    error PartialFillUnsupported(uint256 requestedEth, uint256 filledEth);
 
     constructor(address poolManager) {
         if (poolManager == address(0)) revert ZeroAddress();
@@ -141,11 +156,20 @@ contract GotchiFeeHook is IHooks, IGotchiEvents {
         bytes calldata
     ) external onlyPoolManager returns (bytes4, int128) {
         if (!_charges(key)) return (IHooks.afterSwap.selector, 0);
+        int128 ethDelta = delta.amount0();
+        uint256 ethMoved = ethDelta < 0 ? uint256(uint128(-ethDelta)) : uint256(uint128(ethDelta));
         uint256 fee = 0;
-        if (!ethIsSpecified(params)) {
-            int128 ethDelta = delta.amount0();
-            uint256 ethAmount = ethDelta < 0 ? uint256(uint128(-ethDelta)) : uint256(uint128(ethDelta));
-            fee = calculateFee(ethAmount);
+        if (ethIsSpecified(params)) {
+            // The fee was taken in beforeSwap from the requested amount. Accept the swap only when the
+            // pool moved the whole request net of that fee, so the fee is never charged on unfilled ETH.
+            // Exact-in: the pool received request - fee. Exact-out: the pool paid out request + fee.
+            bool exactIn = params.amountSpecified < 0;
+            uint256 requested = exactIn ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
+            uint256 preFee = calculateFee(requested);
+            uint256 filled = exactIn ? ethMoved + preFee : (ethMoved > preFee ? ethMoved - preFee : 0);
+            if (filled != requested) revert PartialFillUnsupported(requested, filled);
+        } else {
+            fee = calculateFee(ethMoved);
             if (fee > 0) _skim(key, sender, fee, false);
         }
         _poke();

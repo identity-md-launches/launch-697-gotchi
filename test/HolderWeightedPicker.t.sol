@@ -17,6 +17,8 @@ contract HolderWeightedPickerTest is Test {
 
     uint256 internal constant MIN = GotchiConfig.MIN_ENROLL_BALANCE;
 
+    event HolderDisplaced(address indexed holder, uint256 weight, address indexed by);
+    event HolderRefreshed(address indexed holder, uint256 weight, uint256 sinceBlock);
     event SnapshotTaken(uint256 indexed snapshotId, uint256 blockNumber, uint256 holders, uint256 totalWeight);
 
     function setUp() public {
@@ -71,14 +73,184 @@ contract HolderWeightedPickerTest is Test {
         picker.enroll();
     }
 
-    function test_registryIsCapped() public {
+    function test_fullRegistryRefusesAnEqualBalanceCheaply() public {
         for (uint256 i = 0; i < GotchiConfig.MAX_HOLDERS; ++i) {
             _enroll(address(uint160(0xBEEF00 + i)), MIN);
         }
         token.transfer(alice, MIN);
         vm.prank(alice);
         vm.expectRevert(HolderWeightedPicker.RegistryFull.selector);
+        picker.enroll{gas: 60_000}(); // constant cost: no scan on the refused path
+    }
+
+    function test_fullRegistryLetsALargerHolderDisplaceTheSmallest() public {
+        for (uint256 i = 0; i < GotchiConfig.MAX_HOLDERS; ++i) {
+            _enroll(address(uint160(0xBEEF00 + i)), MIN + (i == 77 ? 0 : 5e18));
+        }
+        address smallest = address(uint160(0xBEEF00 + 77));
+        assertEq(picker.lowestHolder(), smallest);
+
+        token.transfer(alice, 100_000_000e18);
+        vm.expectEmit(true, true, false, true, address(picker));
+        emit HolderDisplaced(smallest, MIN, alice);
+        vm.prank(alice);
         picker.enroll();
+
+        assertTrue(picker.isEnrolled(alice));
+        assertFalse(picker.isEnrolled(smallest));
+        assertEq(picker.holderCount(), GotchiConfig.MAX_HOLDERS);
+        assertTrue(picker.lowestHolder() != smallest && picker.lowestHolder() != alice);
+
+        uint256 id = picker.snapshot();
+        uint256 total = picker.snapshotInfo(id).totalWeight;
+        assertEq(total, 100_000_000e18 + 127 * (MIN + 5e18));
+        (address top, uint256 weight) = picker.pick(id, total - 1);
+        assertEq(top, alice);
+        assertEq(weight, 100_000_000e18);
+
+        // the displaced holder can come back by beating the new smallest weight
+        token.transfer(smallest, 10e18);
+        vm.prank(smallest);
+        picker.enroll();
+        assertTrue(picker.isEnrolled(smallest));
+    }
+
+    function test_weightIsTheLesserOfRecordedAndLiveBalance() public {
+        _enroll(alice, 5 * MIN);
+        _enroll(bob, 2 * MIN);
+        // alice receives more after enrolling: no extra weight until she refreshes
+        token.transfer(alice, 100 * MIN);
+        // bob sells half: counts against him at once
+        vm.prank(bob);
+        token.transfer(carol, MIN);
+        assertEq(picker.weightOf(alice, type(uint256).max), 5 * MIN);
+        assertEq(picker.weightOf(bob, type(uint256).max), MIN);
+        assertEq(picker.weightOf(carol, type(uint256).max), 0, "not enrolled");
+        uint256 id = picker.snapshot();
+        assertEq(picker.snapshotInfo(id).totalWeight, 6 * MIN);
+    }
+
+    function test_refreshRecordsTheBalanceAndRestartsMaturityOnlyWhenRaising() public {
+        _enroll(alice, 5 * MIN);
+        uint256 enrolledAt = block.number;
+        vm.roll(enrolledAt + 10);
+
+        vm.prank(bob);
+        vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.NotEnrolled.selector, bob));
+        picker.refresh();
+
+        // lowering keeps the original maturity
+        vm.prank(alice);
+        token.transfer(carol, MIN);
+        vm.prank(alice);
+        picker.refresh();
+        (uint256 weight, uint256 since) = picker.registrationOf(alice);
+        assertEq(weight, 4 * MIN);
+        assertEq(since, enrolledAt);
+
+        // raising restarts it
+        token.transfer(alice, 6 * MIN);
+        vm.expectEmit(true, false, false, true, address(picker));
+        emit HolderRefreshed(alice, 10 * MIN, enrolledAt + 10);
+        vm.prank(alice);
+        picker.refresh();
+        (weight, since) = picker.registrationOf(alice);
+        assertEq(weight, 10 * MIN);
+        assertEq(since, enrolledAt + 10);
+
+        // below the minimum there is nothing to record
+        vm.prank(alice);
+        token.transfer(carol, 10 * MIN - 1);
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.BelowMinimumBalance.selector, 1, MIN));
+        picker.refresh();
+    }
+
+    function test_snapshotForCountsOnlyMatureWeight() public {
+        uint256 maturity = GotchiConfig.ENROLL_MATURITY_BLOCKS;
+        _enroll(alice, 5 * MIN);
+        uint256 aliceBlock = block.number;
+        vm.roll(aliceBlock + 100);
+        _enroll(bob, 20 * MIN);
+
+        // a purchase one block short of alice's maturity: nobody counts
+        uint256 id = picker.snapshotFor(aliceBlock + maturity - 1);
+        assertEq(picker.snapshotInfo(id).totalWeight, 0);
+        (address none,) = picker.pick(id, 1);
+        assertEq(none, address(0));
+
+        // exactly at alice's maturity: alice only
+        id = picker.snapshotFor(aliceBlock + maturity);
+        assertEq(picker.snapshotInfo(id).totalWeight, 5 * MIN);
+        assertEq(picker.weightOf(bob, aliceBlock + maturity), 0);
+
+        // once bob matured too: both
+        id = picker.snapshotFor(aliceBlock + 100 + maturity);
+        assertEq(picker.snapshotInfo(id).totalWeight, 25 * MIN);
+
+        // the unrestricted snapshot ignores age
+        id = picker.snapshot();
+        assertEq(picker.snapshotInfo(id).totalWeight, 25 * MIN);
+    }
+
+    function test_trimLowersAStaleWeightSoItCanBeDisplaced() public {
+        // a squatter enrols 128 addresses with a large balance each (the same tokens, passed along)
+        uint256 big = 1_000_000e18;
+        address previous = address(this);
+        for (uint256 i = 0; i < GotchiConfig.MAX_HOLDERS; ++i) {
+            address squatter = address(uint160(0x5A00 + i));
+            vm.prank(previous);
+            token.transfer(squatter, big + MIN * (GotchiConfig.MAX_HOLDERS - i));
+            vm.prank(squatter);
+            picker.enroll();
+            previous = squatter;
+        }
+        // every squatter but the last now holds far less than it recorded
+        address first = address(uint160(0x5A00));
+        token.transfer(alice, 10 * MIN);
+        vm.prank(alice);
+        vm.expectRevert(HolderWeightedPicker.RegistryFull.selector);
+        picker.enroll();
+
+        // snapshots already ignore the stale weight
+        assertEq(picker.weightOf(first, type(uint256).max), token.balanceOf(first));
+
+        // anyone trims the stale record, which makes the slot displaceable
+        vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.NotEnrolled.selector, alice));
+        picker.trim(alice);
+        picker.trim(first);
+        (uint256 weight,) = picker.registrationOf(first);
+        assertEq(weight, token.balanceOf(first));
+        assertEq(picker.lowestHolder(), first);
+        vm.expectRevert(
+            abi.encodeWithSelector(HolderWeightedPicker.NothingToTrim.selector, first, token.balanceOf(first))
+        );
+        picker.trim(first);
+
+        vm.prank(alice);
+        picker.enroll();
+        assertTrue(picker.isEnrolled(alice));
+        assertFalse(picker.isEnrolled(first));
+    }
+
+    function test_lowestHolderFollowsEvictionsAndRefreshes() public {
+        assertEq(picker.lowestHolder(), address(0));
+        _enroll(alice, 3 * MIN);
+        _enroll(bob, 2 * MIN);
+        _enroll(carol, 5 * MIN);
+        assertEq(picker.lowestHolder(), bob);
+        token.transfer(bob, 10 * MIN);
+        vm.prank(bob);
+        picker.refresh();
+        assertEq(picker.lowestHolder(), alice);
+        vm.prank(alice);
+        token.transfer(dead, 3 * MIN);
+        picker.evict(alice);
+        assertEq(picker.lowestHolder(), carol);
+        vm.prank(carol);
+        token.transfer(dead, 5 * MIN);
+        picker.evict(carol);
+        assertEq(picker.lowestHolder(), bob);
     }
 
     function test_evictOnlyWhenBelowMinimum() public {

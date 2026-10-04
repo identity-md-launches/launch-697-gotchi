@@ -86,6 +86,61 @@ contract FeeSinkTest is GotchiFixture {
         assertEq(market.activeCount(), 1);
     }
 
+    function test_noBuyAbovePriceCeilingWhateverTheBalance() public {
+        // a stranger prices a free mint at the whole pot: the sink never pays more than MAX_BUY_PRICE
+        fundSink(1 ether);
+        listNft(stranger, 1 ether);
+        (bool possible,) = feeSink.pendingBuy();
+        assertFalse(possible);
+        assertFalse(feeSink.tryBuy());
+        listNft(stranger, GotchiConfig.MAX_BUY_PRICE + 1);
+        assertFalse(feeSink.tryBuy());
+        assertEq(address(feeSink).balance, 1 ether, "pot untouched");
+        assertEq(feeSink.buyCount(), 0);
+
+        // exactly at the ceiling is allowed, and costs the sink no more than the ceiling
+        (uint256 listingId,) = listNft(seller, GotchiConfig.MAX_BUY_PRICE);
+        (possible,) = feeSink.pendingBuy();
+        assertTrue(possible);
+        vm.expectEmit(true, false, false, true, address(feeSink));
+        emit BuyTriggered(listingId, GotchiConfig.MAX_BUY_PRICE, 3);
+        assertTrue(feeSink.tryBuy());
+        assertEq(address(feeSink).balance, 1 ether - GotchiConfig.MAX_BUY_PRICE);
+    }
+
+    function test_priceBandConstants() public view {
+        assertEq(feeSink.MAX_BUY_PRICE(), 0.05 ether);
+        assertEq(feeSink.MIN_BUY_PRICE(), 0.001 ether);
+        assertEq(feeSink.MIN_BUY_PRICE(), market.MIN_LIST_PRICE(), "the market refuses what the sink would skip");
+    }
+
+    function test_oneThresholdOfFeesFundsAtMostTenPurchases() public {
+        // floor-priced listings: purchases stop as soon as the balance is back under the threshold
+        for (uint256 i = 0; i < 12; ++i) {
+            listNft(stranger, GotchiConfig.MIN_LIST_PRICE);
+        }
+        fundSink(THRESHOLD);
+        uint256 buys = 0;
+        while (feeSink.tryBuy()) buys += 1;
+        assertEq(buys, 1, "one purchase takes the balance under the threshold");
+        fundSink(THRESHOLD);
+        while (feeSink.tryBuy()) buys += 1;
+        assertLe(buys, 11);
+        assertLt(address(feeSink).balance, THRESHOLD);
+    }
+
+    function test_marketFullOfUnaffordableListingsDoesNotStopAnHonestSale() public {
+        for (uint256 i = 0; i < GotchiConfig.MAX_ACTIVE_LISTINGS; ++i) {
+            listNft(stranger, 1_000_000 ether);
+        }
+        fundSink(1 ether);
+        assertFalse(feeSink.tryBuy(), "nothing inside the band yet");
+        (, uint256 tokenId) = listNft(seller, 0.001 ether);
+        assertTrue(feeSink.tryBuy());
+        assertEq(nft.ownerOf(tokenId), address(escrow));
+        assertEq(market.proceeds(seller), 0.001 ether);
+    }
+
     function test_buysCheapestAtThresholdAndForwardsToEscrow() public {
         (uint256 expensiveId,) = listNft(seller, 0.009 ether);
         (uint256 cheapId, uint256 cheapToken) = listNft(seller, 0.004 ether);

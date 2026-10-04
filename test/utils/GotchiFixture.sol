@@ -123,10 +123,12 @@ abstract contract GotchiFixture is Test, GotchiDeployment {
 
     // ---- holders ----
 
+    /// @dev Enrols `who` and lets the recorded weight mature, so it counts for any later purchase.
     function giveAndEnroll(address who, uint256 amount) internal {
         token.transfer(who, amount);
         vm.prank(who);
         picker.enroll();
+        vm.roll(block.number + picker.ENROLL_MATURITY_BLOCKS());
     }
 
     // ---- flips ----

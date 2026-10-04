@@ -4,6 +4,8 @@ pragma solidity 0.8.26;
 import {GotchiFixture} from "./utils/GotchiFixture.sol";
 import {GotchiFeeHook} from "../src/GotchiFeeHook.sol";
 import {GotchiConfig} from "../src/GotchiConfig.sol";
+import {ForeverLiquidity} from "../src/ForeverLiquidity.sol";
+import {CustomRevert} from "v4-core/libraries/CustomRevert.sol";
 import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
@@ -125,7 +127,7 @@ contract GotchiFeeHookTest is GotchiFixture {
 
     function test_ethExactOutDeliversExactEthAndSkimsFee() public {
         token.transfer(bob, 200_000_000e18);
-        int256 ethOut = 0.1 ether;
+        int256 ethOut = 0.01 ether;
         uint256 fee = hook.calculateFee(uint256(ethOut));
         BalanceDelta delta = swapAs(bob, false, ethOut, 0);
 
@@ -135,7 +137,9 @@ contract GotchiFeeHookTest is GotchiFixture {
     }
 
     function testFuzz_ethExactInFeeMatchesCalculateFee(uint256 ethIn) public {
-        ethIn = bound(ethIn, 1, 50 ether);
+        // The fee is taken from the PoolManager before the swapper settles, so in this single-pool fixture
+        // it has to fit in the 0.1 ETH the manager holds. The real PoolManager holds every pool's ETH.
+        ethIn = bound(ethIn, 1, 20 ether);
         buyTokens(alice, ethIn);
         assertEq(address(feeSink).balance, hook.calculateFee(ethIn));
         assertEq(alice.balance, 100 ether - ethIn);
@@ -210,21 +214,17 @@ contract GotchiFeeHookTest is GotchiFixture {
         GotchiFeeHook fresh =
             _deployUnwiredHook(address(uint160(0x3000000000000000000000000000000000000000) | uint160(0xCC)));
         fresh.wire(address(badSink));
-        PoolKey memory freshKey = PoolKey({
-            currency0: Currency.wrap(address(0)),
-            currency1: Currency.wrap(address(token)),
-            fee: 3000,
-            tickSpacing: 60,
-            hooks: IHooks(address(fresh))
-        });
-        manager.initialize(freshKey, initialSqrtPrice);
+        ForeverLiquidity freshPool = new ForeverLiquidity(address(manager), address(token), address(fresh));
+        PoolKey memory freshKey = freshPool.poolKey();
+        token.approve(address(freshPool), 50_000_000e18);
+        freshPool.seed{value: 0.1 ether}(initialSqrtPrice, initialSqrtPrice, initialSqrtPrice, 50_000_000e18);
         vm.prank(alice);
         vm.expectEmit(false, false, false, true, address(fresh));
         emit BuyPoked(false);
         router.swap{value: 1 ether}(
-            freshKey, SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: initialSqrtPrice - 1})
+            freshKey,
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1})
         );
-        // with no liquidity nothing is swapped, but the fee on the specified ETH input is still taken
         uint256 fee = hook.calculateFee(1 ether);
         assertEq(address(badSink).balance, fee, "fee delivered even though tryBuy reverted");
         assertEq(fresh.totalFeesCollected(), fee);
@@ -234,9 +234,131 @@ contract GotchiFeeHookTest is GotchiFixture {
         vm.expectEmit(false, false, false, true, address(fresh));
         emit BuyPoked(false);
         router.swap{value: 1 ether}(
-            freshKey, SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: initialSqrtPrice - 2})
+            freshKey,
+            SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1})
         );
         assertEq(address(badSink).balance, 2 * fee, "out-of-gas inside the stipend is swallowed too");
+    }
+
+    // ---- partial fills ----
+
+    function test_ethExactInPartialFillIsRefused() public {
+        // limit 0.1% below spot: the pool can only take ~0.0001 ETH of the 1 ETH request
+        uint160 limit = uint160((uint256(initialSqrtPrice) * 999) / 1000);
+        uint256 aliceBefore = alice.balance;
+        vm.prank(alice);
+        (bool ok, bytes memory reason) = address(router).call{value: 1 ether}(
+            abi.encodeCall(
+                router.swap, (key, SwapParams({zeroForOne: true, amountSpecified: -1 ether, sqrtPriceLimitX96: limit}))
+            )
+        );
+        assertFalse(ok, "a partially filled ETH exact-in swap reverts");
+        _assertPartialFillRevert(reason);
+        assertEq(alice.balance, aliceBefore, "nothing charged");
+        assertEq(address(feeSink).balance, 0, "no fee on ETH that never moved");
+        assertEq(hook.totalFeesCollected(), 0);
+    }
+
+    function test_ethExactOutPartialFillIsRefused() public {
+        token.transfer(bob, 10_000_000e18);
+        uint160 limit = uint160((uint256(initialSqrtPrice) * 1001) / 1000);
+        vm.startPrank(bob);
+        token.approve(address(router), type(uint256).max);
+        (bool ok, bytes memory reason) = address(router)
+            .call(
+                abi.encodeCall(
+                    router.swap,
+                    (
+                        key,
+                        SwapParams({zeroForOne: false, amountSpecified: int256(0.05 ether), sqrtPriceLimitX96: limit})
+                    )
+                )
+            );
+        vm.stopPrank();
+        assertFalse(ok, "a partially filled ETH exact-out swap reverts");
+        _assertPartialFillRevert(reason);
+        assertEq(bob.balance, 100 ether, "the seller never pays ETH");
+        assertEq(token.balanceOf(bob), 10_000_000e18);
+        assertEq(address(feeSink).balance, 0);
+    }
+
+    function test_ethSpecifiedSwapThatStaysInsideItsLimitStillFills() public {
+        // a limit the swap does not reach is not a partial fill
+        uint160 limit = uint160((uint256(initialSqrtPrice) * 90) / 100);
+        vm.prank(alice);
+        router.swap{value: 0.001 ether}(
+            key, SwapParams({zeroForOne: true, amountSpecified: -0.001 ether, sqrtPriceLimitX96: limit})
+        );
+        assertEq(address(feeSink).balance, hook.calculateFee(0.001 ether));
+    }
+
+    function test_tokenExactInPartialFillPaysFeeOnRealisedEthOnly() public {
+        token.transfer(bob, 10_000_000e18);
+        uint160 limit = uint160((uint256(initialSqrtPrice) * 1001) / 1000);
+        vm.startPrank(bob);
+        token.approve(address(router), type(uint256).max);
+        BalanceDelta delta = router.swap(
+            key, SwapParams({zeroForOne: false, amountSpecified: -int256(10_000_000e18), sqrtPriceLimitX96: limit})
+        );
+        vm.stopPrank();
+        uint256 received = uint256(uint128(delta.amount0()));
+        uint256 fee = address(feeSink).balance;
+        assertGt(token.balanceOf(bob), 9_000_000e18, "only a sliver of the order filled");
+        assertGt(received, 0);
+        assertEq(fee, hook.calculateFee(received + fee), "30 bps of the ETH that actually left the pool");
+    }
+
+    function test_tokenExactOutPartialFillPaysFeeOnRealisedEthOnly() public {
+        uint160 limit = uint160((uint256(initialSqrtPrice) * 999) / 1000);
+        vm.prank(carol);
+        BalanceDelta delta = router.swap{value: 5 ether}(
+            key, SwapParams({zeroForOne: true, amountSpecified: int256(10_000_000e18), sqrtPriceLimitX96: limit})
+        );
+        uint256 paid = uint256(uint128(-delta.amount0()));
+        uint256 fee = address(feeSink).balance;
+        assertLt(uint256(uint128(delta.amount1())), 10_000_000e18, "partial fill");
+        assertEq(fee, hook.calculateFee(paid - fee), "30 bps of the ETH that actually entered the pool");
+        assertEq(carol.balance, 100 ether - paid);
+    }
+
+    function _assertPartialFillRevert(bytes memory reason) internal pure {
+        // PoolManager wraps hook reverts: WrappedError(hook, afterSwap.selector, reason, HookCallFailed)
+        assertEq(bytes4(reason), CustomRevert.WrappedError.selector);
+        (,, bytes memory inner,) = abi.decode(_stripSelector(reason), (address, bytes4, bytes, bytes));
+        assertEq(bytes4(inner), GotchiFeeHook.PartialFillUnsupported.selector);
+    }
+
+    function _stripSelector(bytes memory data) internal pure returns (bytes memory out) {
+        out = new bytes(data.length - 4);
+        for (uint256 i = 0; i < out.length; ++i) {
+            out[i] = data[i + 4];
+        }
+    }
+
+    // ---- a full market ----
+
+    function test_inSwapPurchaseStillWorksWithAFullMarket() public {
+        // 63 listings far above the band and one affordable: the worst case for the cheapest() scan
+        for (uint256 i = 0; i < GotchiConfig.MAX_ACTIVE_LISTINGS - 1; ++i) {
+            listNft(seller, 100 ether);
+        }
+        (, uint256 tokenId) = listNft(seller, 0.004 ether);
+        assertEq(market.activeCount(), GotchiConfig.MAX_ACTIVE_LISTINGS);
+        buyTokens(carol, 4 ether); // 0.012 ETH fee, purchase inside afterSwap
+        assertEq(feeSink.buyCount(), 1, "bought inside the swap despite 64 active listings");
+        assertEq(nft.ownerOf(tokenId), address(escrow));
+    }
+
+    function test_tryBuyWithAFullMarketFitsTheTriggerGasWithMargin() public {
+        for (uint256 i = 0; i < GotchiConfig.MAX_ACTIVE_LISTINGS - 1; ++i) {
+            listNft(seller, 100 ether);
+        }
+        listNft(seller, 0.004 ether);
+        fundSink(GotchiConfig.MIN_BUY_THRESHOLD);
+        // the hook forwards exactly TRIGGER_GAS; half of it must already be enough
+        vm.prank(address(hook));
+        bool bought = feeSink.tryBuy{gas: GotchiConfig.TRIGGER_GAS / 2}();
+        assertTrue(bought);
     }
 
     function test_feeSinkRejectingEthRevertsTheSwap() public {

@@ -11,10 +11,14 @@ import {Position} from "v4-core/libraries/Position.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {Currency} from "v4-core/types/Currency.sol";
+import {IUnlockCallback} from "v4-core/interfaces/callback/IUnlockCallback.sol";
+import {LaunchToken} from "../src/LaunchToken.sol";
 
 contract ForeverLiquidityTest is GotchiFixture {
     using PoolIdLibrary for PoolKey;
     using StateLibrary for IPoolManager;
+
+    event PoolRealigned(uint160 fromSqrtPriceX96, uint160 toSqrtPriceX96);
 
     function test_poolKeyAndPrice() public view {
         assertEq(Currency.unwrap(key.currency0), address(0), "ETH is currency0");
@@ -105,5 +109,98 @@ contract ForeverLiquidityTest is GotchiFixture {
         assertEq(fresh.currentSqrtPriceX96(), initialSqrtPrice);
         vm.expectRevert(ForeverLiquidity.ZeroAddress.selector);
         new ForeverLiquidity(address(0), address(token), address(hook));
+    }
+
+    // ---- value accrued to the locked position ----
+
+    function test_donationStaysInThePoolAndSeedersPayTheirOwnPrincipal() public {
+        Donor donor = new Donor(manager);
+        donor.donate{value: 0.03 ether}(key, 0.03 ether);
+
+        // (a) a seed smaller than the accrued amount still works and pays its own ETH
+        token.transfer(alice, 1_000_000e18);
+        uint256 managerEth = address(manager).balance;
+        uint256 aliceEth = alice.balance;
+        vm.startPrank(alice);
+        token.approve(address(forever), 1_000_000e18);
+        forever.seed{value: 0.002 ether}(initialSqrtPrice, initialSqrtPrice - 1, initialSqrtPrice + 1, 1_000_000e18);
+        vm.stopPrank();
+        uint256 alicePaid = aliceEth - alice.balance;
+        assertApproxEqAbs(alicePaid, 0.002 ether, 1e6, "alice paid her whole ETH principal");
+        assertEq(address(manager).balance, managerEth + alicePaid, "the donation did not leave the manager");
+
+        // (b) a larger seeder gets no discount either
+        donor.donate{value: 0.03 ether}(key, 0.03 ether);
+        token.transfer(carol, 40_000_000e18);
+        uint256 carolEth = carol.balance;
+        vm.startPrank(carol);
+        token.approve(address(forever), 40_000_000e18);
+        forever.seed{value: 0.08 ether}(initialSqrtPrice, initialSqrtPrice - 1, initialSqrtPrice + 1, 40_000_000e18);
+        vm.stopPrank();
+        assertApproxEqAbs(carolEth - carol.balance, 0.08 ether, 1e6, "carol paid her whole ETH principal");
+        assertEq(address(forever).balance, 0);
+        assertEq(token.balanceOf(address(forever)), 0);
+    }
+
+    // ---- a pool somebody else opened first ----
+
+    function test_seedRealignsAnEmptyPoolOpenedAtAHostilePrice() public {
+        LaunchToken other = new LaunchToken();
+        ForeverLiquidity fresh = new ForeverLiquidity(address(manager), address(other), address(hook));
+        PoolKey memory freshKey = fresh.poolKey();
+        vm.prank(stranger);
+        manager.initialize(freshKey, TickMath.MAX_SQRT_PRICE - 1);
+
+        uint160 p = fresh.sqrtPriceFromAmounts(0.1 ether, 50_000_000e18);
+        other.approve(address(fresh), 50_000_000e18);
+        vm.expectEmit(false, false, false, true, address(fresh));
+        emit PoolRealigned(TickMath.MAX_SQRT_PRICE - 1, p);
+        fresh.seed{value: 0.1 ether}(p, p, p, 50_000_000e18);
+
+        assertEq(fresh.currentSqrtPriceX96(), p, "pool opened at the operator's price");
+        assertGt(IPoolManager(address(manager)).getLiquidity(freshKey.toId()), 0);
+        assertApproxEqRel(other.balanceOf(address(manager)), 50_000_000e18, 0.001e18);
+        assertEq(other.balanceOf(address(fresh)), 0);
+    }
+
+    function test_seedRealignsUpwardsToo() public {
+        LaunchToken other = new LaunchToken();
+        ForeverLiquidity fresh = new ForeverLiquidity(address(manager), address(other), address(hook));
+        vm.prank(stranger);
+        manager.initialize(fresh.poolKey(), TickMath.MIN_SQRT_PRICE + 1);
+        uint160 p = fresh.sqrtPriceFromAmounts(0.1 ether, 50_000_000e18);
+        other.approve(address(fresh), 50_000_000e18);
+        fresh.seed{value: 0.1 ether}(p, p, p, 50_000_000e18);
+        assertEq(fresh.currentSqrtPriceX96(), p);
+    }
+
+    function test_poolWithLiquidityIsNeverRealigned() public {
+        // the fixture pool has liquidity: a seed naming another price just fails its band
+        uint160 elsewhere = initialSqrtPrice * 2;
+        token.approve(address(forever), 1e18);
+        vm.expectRevert(
+            abi.encodeWithSelector(ForeverLiquidity.PriceOutOfBand.selector, initialSqrtPrice, elsewhere, elsewhere)
+        );
+        forever.seed{value: 1e15}(elsewhere, elsewhere, elsewhere, 1e18);
+    }
+}
+
+/// @dev Donates ETH to a pool's in-range liquidity, the way any stranger can.
+contract Donor is IUnlockCallback {
+    IPoolManager internal immutable manager;
+
+    constructor(IPoolManager manager_) {
+        manager = manager_;
+    }
+
+    function donate(PoolKey memory key, uint256 amount) external payable {
+        manager.unlock(abi.encode(key, amount));
+    }
+
+    function unlockCallback(bytes calldata raw) external returns (bytes memory) {
+        (PoolKey memory key, uint256 amount) = abi.decode(raw, (PoolKey, uint256));
+        manager.donate(key, amount, 0, "");
+        manager.settle{value: amount}();
+        return "";
     }
 }

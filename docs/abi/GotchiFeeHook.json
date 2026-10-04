@@ -1289,6 +1289,22 @@
   },
   {
     "type": "error",
+    "name": "PartialFillUnsupported",
+    "inputs": [
+      {
+        "name": "requestedEth",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "filledEth",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "ZeroAddress",
     "inputs": []
   }

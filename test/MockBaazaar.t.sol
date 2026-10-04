@@ -18,6 +18,7 @@ contract MockBaazaarTest is Test {
     address internal escrow = makeAddr("escrow");
 
     event ListingMocked(uint256 indexed listingId, uint256 tokenId, uint256 price);
+    event ListingEvicted(uint256 indexed listingId, uint256 tokenId, uint256 indexed byListingId);
     event ListingSold(uint256 indexed listingId, uint256 tokenId, uint256 price, address indexed buyer, address to);
 
     function setUp() public {
@@ -64,6 +65,12 @@ contract MockBaazaarTest is Test {
         vm.prank(seller);
         vm.expectRevert(MockBaazaar.InvalidPrice.selector);
         market.list(tokenId, 0);
+        vm.prank(seller);
+        vm.expectRevert(MockBaazaar.InvalidPrice.selector);
+        market.list(tokenId, GotchiConfig.MIN_LIST_PRICE - 1);
+        vm.prank(seller);
+        vm.expectRevert(MockBaazaar.InvalidPrice.selector);
+        market.list(tokenId, uint256(type(uint192).max) + 1);
 
         vm.prank(other);
         vm.expectRevert(
@@ -72,7 +79,7 @@ contract MockBaazaarTest is Test {
         market.list(tokenId, 1 ether);
     }
 
-    function test_listIsCapped() public {
+    function test_fullMarketRefusesAListingThatIsNotCheaper() public {
         for (uint256 i = 0; i < GotchiConfig.MAX_ACTIVE_LISTINGS; ++i) {
             _list(seller, 1 ether);
         }
@@ -81,7 +88,67 @@ contract MockBaazaarTest is Test {
         nft.approve(address(market), tokenId);
         vm.expectRevert(MockBaazaar.MarketFull.selector);
         market.list(tokenId, 1 ether);
+        vm.expectRevert(MockBaazaar.MarketFull.selector);
+        market.list(tokenId, 2 ether);
         vm.stopPrank();
+        assertEq(market.activeCount(), GotchiConfig.MAX_ACTIVE_LISTINGS);
+    }
+
+    function test_fullMarketLetsACheaperListingEvictTheMostExpensive() public {
+        // 62 at 1 ETH, then two at 5 ETH: the newer of the two most expensive is evicted first
+        for (uint256 i = 0; i < GotchiConfig.MAX_ACTIVE_LISTINGS - 2; ++i) {
+            _list(seller, 1 ether);
+        }
+        (uint256 olderId, uint256 olderToken) = _list(other, 5 ether);
+        (uint256 newerId, uint256 newerToken) = _list(other, 5 ether);
+
+        uint256 tokenId = nft.mint(seller);
+        vm.startPrank(seller);
+        nft.approve(address(market), tokenId);
+        vm.expectEmit(true, true, false, true, address(market));
+        emit ListingEvicted(newerId, newerToken, newerId + 1);
+        uint256 listingId = market.list(tokenId, 0.5 ether);
+        vm.stopPrank();
+
+        assertEq(market.activeCount(), GotchiConfig.MAX_ACTIVE_LISTINGS, "still full");
+        assertFalse(market.getListing(newerId).active, "most expensive, newest listing evicted");
+        assertTrue(market.getListing(olderId).active);
+        assertEq(nft.ownerOf(newerToken), other, "evicted NFT returned to its seller");
+        assertEq(nft.ownerOf(olderToken), address(market));
+        assertEq(market.cheapest().listingId, listingId, "the newcomer is now the cheapest");
+
+        // the evicted seller cannot cancel a listing that is gone, and may list again
+        vm.prank(other);
+        vm.expectRevert(MockBaazaar.NoListings.selector);
+        market.cancel(newerId);
+    }
+
+    function test_marketCannotBeFrozenByExpensiveListings() public {
+        for (uint256 i = 0; i < GotchiConfig.MAX_ACTIVE_LISTINGS; ++i) {
+            _list(address(uint160(0xA11CE000 + i)), 1_000_000 ether);
+        }
+        (uint256 honestId, uint256 honestToken) = _list(seller, 0.001 ether);
+        IMockBaazaar.Listing memory best = market.cheapest();
+        assertEq(best.listingId, honestId);
+        vm.prank(buyer);
+        market.buyCheapest{value: 0.001 ether}(honestId, escrow);
+        assertEq(nft.ownerOf(honestToken), escrow);
+        assertEq(market.proceeds(seller), 0.001 ether);
+    }
+
+    function test_activeIdsSurviveSwapAndPop() public {
+        (uint256 a,) = _list(seller, 3 ether);
+        (uint256 b,) = _list(seller, 2 ether);
+        (uint256 c,) = _list(seller, 4 ether);
+        vm.prank(seller);
+        market.cancel(a);
+        assertEq(market.activeCount(), 2);
+        assertEq(market.activeIdAt(0), c, "last entry moved into the freed slot");
+        assertEq(market.activeIdAt(1), b);
+        assertEq(market.cheapest().listingId, b);
+        vm.prank(seller);
+        market.cancel(c);
+        assertEq(market.cheapest().listingId, b);
     }
 
     function test_cheapestPicksLowestPriceThenLowestId() public {

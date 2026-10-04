@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 /// @notice The part of FeeSink the hook depends on.
 interface IFeeSink {
     /// @notice Attempt a purchase of the cheapest listing. Returns false (without reverting) when the
-    /// balance is below threshold, there is no listing, or the cheapest listing costs more than the balance.
+    /// balance is below threshold, there is no listing, or the cheapest listing costs more than the balance
+    /// or lies outside the sink's per-purchase price band.
     function tryBuy() external returns (bool bought);
 }

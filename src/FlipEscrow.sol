@@ -14,7 +14,8 @@ import {GotchiConfig} from "./GotchiConfig.sol";
 /// selected by HolderWeightedPicker.
 /// @dev Randomness is a commit-reveal MOCK, not production randomness:
 ///   1. `requestFlip` (FeeSink only) registers the NFT.
-///   2. The flipper commits `keccak256(abi.encode(seed))`; the commit also freezes the holder snapshot.
+///   2. The flipper commits `keccak256(abi.encode(seed))`; the commit also freezes the holder snapshot,
+///      counting only weight recorded ENROLL_MATURITY_BLOCKS before the purchase (see the picker).
 ///   3. From `commitBlock + REVEAL_DELAY_BLOCKS` the seed is revealed by anyone who knows it. The random
 ///      word is `keccak256(seed, blockhash(commitBlock + 1), acquisitionId, tokenId)`: the flipper cannot
 ///      know the block hash at commit time and a block builder does not know the seed.
@@ -140,7 +141,7 @@ contract FlipEscrow is IFlipEscrow, IGotchiEvents, Ownable2Step, ReentrancyGuard
         acquisition.status = Status.Committed;
         acquisition.commitment = commitment;
         acquisition.commitBlock = uint64(block.number);
-        uint256 snapshotId = PICKER.snapshot();
+        uint256 snapshotId = PICKER.snapshotFor(acquisition.requestBlock);
         acquisition.snapshotId = snapshotId;
         emit FlipCommitted(acquisitionId, commitment, block.number, snapshotId);
     }

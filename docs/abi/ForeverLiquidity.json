@@ -312,6 +312,25 @@
   },
   {
     "type": "event",
+    "name": "PoolRealigned",
+    "inputs": [
+      {
+        "name": "fromSqrtPriceX96",
+        "type": "uint160",
+        "indexed": false,
+        "internalType": "uint160"
+      },
+      {
+        "name": "toSqrtPriceX96",
+        "type": "uint160",
+        "indexed": false,
+        "internalType": "uint160"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
     "name": "PositionIncreased",
     "inputs": [
       {
@@ -366,6 +385,22 @@
       },
       {
         "name": "max",
+        "type": "uint160",
+        "internalType": "uint160"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "RealignFailed",
+    "inputs": [
+      {
+        "name": "current",
+        "type": "uint160",
+        "internalType": "uint160"
+      },
+      {
+        "name": "target",
         "type": "uint160",
         "internalType": "uint160"
       }

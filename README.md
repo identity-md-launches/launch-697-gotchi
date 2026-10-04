@@ -3,7 +3,7 @@
 A standalone Foundry project. `$GOTCHI` (contract `LaunchToken`) trades against ETH in a permanent
 full-range Uniswap v4 pool. A v4 hook skims 0.30% of the ETH side of every swap into `FeeSink`.
 Whenever the sink holds at least 0.01 ETH it buys the cheapest listed mock Aavegotchi from
-`MockBaazaar` and hands it to `FlipEscrow`, which resolves each acquisition 50/50 under a
+`MockBaazaar` (inside a per-purchase price band of 0.001 to 0.05 ETH) and hands it to `FlipEscrow`, which resolves each acquisition 50/50 under a
 commit-reveal mock randomness: burn it to `0x…dEaD`, or airdrop it to a `$GOTCHI` holder picked by
 `HolderWeightedPicker` in proportion to balance. Every hop emits an event for a future UI.
 
@@ -26,12 +26,12 @@ launchpad / bonding-curve / graduation mechanics, no website.
 | `LaunchToken` | `$GOTCHI`: fixed 1,000,000,000 × 10^18 supply minted to the deployer, name and symbol `GOTCHI`. No mint, owner, pause, blocklist, fee or upgrade. | none |
 | `GotchiFeeHook` | v4 hook (`beforeSwap`, `afterSwap`, both return-delta flags, address low 14 bits = `0x00CC`). Skims `FEE_BPS` of the ETH amount of each swap on any ETH-paired pool, `take`s it straight to `FeeSink`, then pokes `FeeSink.tryBuy()` inside try/catch with a gas stipend. Constructor arg: the PoolManager address only. | `DEPLOYER` (constructor `msg.sender`) calls `wire(feeSink)` once |
 | `GotchiHookDeployer` | CREATE2 deployer for the hook: mines a flag-valid salt (`findSalt`), deploys and wires the sink in one transaction so nobody can race the wiring. | `OWNER` may call `deploy` |
-| `FeeSink` | Receives ETH. `tryBuy()` buys the cheapest listing once balance ≥ `MIN_BUY_THRESHOLD`, delivers the NFT to `FlipEscrow` and registers the flip. `nonReentrant`, checks-effects-interactions, no withdraw/sweep/treasury. | `owner` (Ownable2Step): `setHook` once; may call `tryBuy` as a keeper |
-| `MockBaazaar` | Mock ETH-priced ERC-721 marketplace: `list`, `cancel`, `cheapest()`, `buyCheapest(expectedListingId, to)`. Seller proceeds are pull payments (`withdrawProceeds`). Active listings capped at 64. | none |
+| `FeeSink` | Receives ETH. `tryBuy()` buys the cheapest listing once balance ≥ `MIN_BUY_THRESHOLD`, provided its price is within `MIN_LIST_PRICE`…`MAX_BUY_PRICE`, delivers the NFT to `FlipEscrow` and registers the flip. `nonReentrant`, checks-effects-interactions, no withdraw/sweep/treasury. | `owner` (Ownable2Step): `setHook` once; may call `tryBuy` as a keeper |
+| `MockBaazaar` | Mock ETH-priced ERC-721 marketplace: `list`, `cancel`, `cheapest()`, `buyCheapest(expectedListingId, to)`. Seller proceeds are pull payments (`withdrawProceeds`). Prices below `MIN_LIST_PRICE` are refused. Active listings capped at 64; when full, a strictly cheaper listing evicts the most expensive one (NFT returned to its seller). | none |
 | `MockGotchiNFT` | Mock Aavegotchi ERC-721, permissionless `mint`. | none |
 | `FlipEscrow` | Holds acquired NFTs; commit-reveal resolution; burn or weighted airdrop; timeouts. | `owner` (Ownable2Step): `setFeeSink` once, `setFlipper`; `flipper` commits |
-| `HolderWeightedPicker` | Opt-in holder registry (`enroll`, `evict`), balance snapshots, deterministic weighted `pick`. | none |
-| `ForeverLiquidity` | Opens the ETH/`$GOTCHI` pool with the hook and holds full-range liquidity that has no removal path. Anyone may `seed` more. | none |
+| `HolderWeightedPicker` | Opt-in holder registry (`enroll`, `refresh`, `trim`, `evict`), snapshots of held balances, deterministic weighted `pick`. When full, a larger holder displaces the smallest entry. | none |
+| `ForeverLiquidity` | Opens the ETH/`$GOTCHI` pool with the hook and holds full-range liquidity that has no removal path. Anyone may `seed` more. Re-aligns an empty pool that a stranger initialized at another price; donates accrued fees back to the pool. | none |
 | `GotchiConfig` | All constants (library). | n/a |
 
 ### Parameters (`src/GotchiConfig.sol`)
@@ -44,11 +44,13 @@ launchpad / bonding-curve / graduation mechanics, no website.
 | `FLIP_BURN_BPS` | 5000 | exact 50/50 |
 | `BURN_ADDRESS` | `0x000000000000000000000000000000000000dEaD` | |
 | `TOKEN_SUPPLY` | 1,000,000,000 × 10^18 | fixed by the launch-token rules (see below) |
-| `INITIAL_LIQUIDITY_ETH` / `INITIAL_LIQUIDITY_TOKENS` | 1 ETH / 500,000,000 GOTCHI | **configurable**; implied opening price 2 × 10⁻⁹ ETH per GOTCHI, implied FDV 2 ETH |
+| `MAX_BUY_PRICE` / `MIN_LIST_PRICE` | 0.05 ETH / 0.001 ETH | the most and the least `FeeSink` pays for one NFT; the market refuses listings under the minimum |
+| `INITIAL_LIQUIDITY_ETH` / `INITIAL_LIQUIDITY_TOKENS` | 0.1 ETH / 50,000,000 GOTCHI | **configurable**; implied opening price 2 × 10⁻⁹ ETH per GOTCHI, implied FDV 2 ETH. Sized to fit the requester wallet after a default factory launch (see Deployment) |
 | `POOL_LP_FEE` / `POOL_TICK_SPACING` | 0 / 60 | configurable; with LP fee 0 the hook fee is the only fee a swapper pays |
 | `MIN_ENROLL_BALANCE` / `MAX_HOLDERS` | 1,000 GOTCHI / 128 | picker registry bounds, configurable |
+| `ENROLL_MATURITY_BLOCKS` | 300 | a recorded weight counts only for NFTs bought at least this many blocks later (about one hour) |
 | `MAX_ACTIVE_LISTINGS` | 64 | market bound |
-| `TRIGGER_GAS` | 700,000 | gas stipend for the in-swap purchase attempt |
+| `TRIGGER_GAS` | 1,000,000 | gas stipend for the in-swap purchase attempt; a purchase with all 64 slots active measures about 485k |
 | `REVEAL_DELAY_BLOCKS` / `REVEAL_WINDOW_BLOCKS` / `COMMIT_TIMEOUT_BLOCKS` | 2 / 200 / 7200 | flip timing |
 
 To change a value: edit the library, rebuild, redeploy. Nothing is settable after deployment.
@@ -76,6 +78,24 @@ PoolManager → FeeSink directly and the hook never holds ETH. `FeesCollected(po
 emitted with `pool = PoolManager` (v4 pools have no address); the companion
 `SwapFeeSkimmed(poolId, swapper, amountEth, viaBeforeSwap)` carries the `PoolId`.
 
+**Fee basis per shape.** The fee is 30 bps of the amount named in the table. ETH exact-in and token
+exact-in therefore pay 30 bps of the gross ETH that crosses the swap. ETH exact-out pays 30 bps of the
+net ETH received and token exact-out pays 30 bps on top of the pool's ETH input, which is 29.91 bps of
+the gross in both cases. The same gross ETH routed as exact-in or exact-out pays a slightly different
+fee, and `FeesCollected` amounts follow the per-shape basis.
+
+**Partial fills.** A v4 swap stops at its `sqrtPriceLimitX96`. For token-specified swaps the fee is
+computed from the ETH that actually moved, so a partial fill pays 30 bps of the filled amount. For
+ETH-specified swaps the fee is taken in `beforeSwap` from the requested amount and v4 gives a hook no
+way to return part of a specified-currency delta afterwards, so `afterSwap` reverts with
+`PartialFillUnsupported` unless the pool swapped the whole request. An ETH-specified swap fills
+completely or not at all; nobody is charged on ETH that did not move. Routers that bound slippage with
+minimum-out / maximum-in amounts and leave the price limit open are unaffected.
+
+**Large ETH exact-in swaps.** The `beforeSwap` fee is taken from the PoolManager before the swapper
+settles, so it must fit in the ETH the PoolManager already holds across all pools. On Sepolia's shared
+PoolManager that is not a practical limit; on a private PoolManager holding only this pool it is.
+
 A pool whose currency0 is not native ETH, or a hook that has not been wired, charges nothing.
 There is no `beforeInitialize` gate and no liquidity gate: anyone may open ETH/anything pools with this
 hook (they would only feed the sink) and anyone may add liquidity.
@@ -84,7 +104,8 @@ hook (they would only feed the sink) and anyone may add liquidity.
 
 1. `afterSwap` calls `FeeSink.tryBuy()` with `TRIGGER_GAS` inside try/catch. `tryBuy` returns `false`
    without reverting when the balance is below threshold, nothing is listed, or the cheapest listing
-   costs more than the balance. A revert or out-of-gas inside the sink is swallowed; the swap always
+   costs more than the balance or lies outside the price band (below `MIN_LIST_PRICE` or above
+   `MAX_BUY_PRICE`). A revert or out-of-gas inside the sink is swallowed; the swap always
    succeeds as long as the sink can receive ETH. The owner may also call `tryBuy()` as a keeper (for
    example when a listing appears while no swaps happen).
 2. `tryBuy` emits `BuyTriggered(listingId, priceEth, tokenId)`, pays exactly the listing price to
@@ -92,7 +113,8 @@ hook (they would only feed the sink) and anyone may add liquidity.
    cheapest, credits the seller, transfers the NFT to the escrow) and calls `FlipEscrow.requestFlip`,
    which emits `FlipRequested(acquisitionId, tokenId, requestId)`.
 3. The flipper calls `commit(acquisitionId, keccak256(abi.encode(seed)))`. The commit freezes the holder
-   snapshot (`HolderWeightedPicker.snapshot()`), so balance moves after this point do not matter.
+   snapshot (`HolderWeightedPicker.snapshotFor(requestBlock)`), so balance moves after this point do
+   not matter, and only weight recorded 300 blocks before the purchase counts.
 4. From `commitBlock + 2` up to `commitBlock + 202`, anyone who knows the seed calls
    `reveal(acquisitionId, seed)`. Random word = `keccak256(seed, blockhash(commitBlock + 1),
    acquisitionId, tokenId)`. Burn iff the top 128 bits × 10,000 < 5000 × 2^128 (an exact half, no
@@ -110,17 +132,50 @@ airdrop to a chosen address. A colluding flipper-and-builder could bias results.
 wired because no subscription keys are available to this task; migrating means replacing steps 3–4 with
 a VRF request/fulfil pair and keeping `FlipRequested.requestId` as the VRF request id (README TODO).
 
-### Holder weighting: snapshot, opt-in, exclusions
+### Purchase price band and what the mock market can and cannot do
 
-- **Snapshot, not live.** Weights are the enrolled holders' balances at the commit block. A holder who
-  sells after the commit can still win that flip; a buyer who enrols after the commit cannot.
+`MockGotchiNFT.mint` is free and `MockBaazaar.list` is open to anyone, so a listing proves nothing about
+value. The ETH the sink spends is therefore bounded per purchase, not trusted to the market:
+
+- **Ceiling.** `FeeSink` never pays more than `MAX_BUY_PRICE` (0.05 ETH, five thresholds) for one NFT,
+  whatever its balance. A listing priced at the whole accumulated pot is simply not bought.
+- **Floor.** `MockBaazaar` refuses listings under `MIN_LIST_PRICE` (0.001 ETH) and the sink would skip
+  them as well, so dust listings cannot turn every swap into a purchase. One threshold of fees funds at
+  most ten purchases.
+- **No freezing.** The 64 slots are not first-come. When the market is full a strictly cheaper listing
+  evicts the most expensive one, so unaffordable listings cannot keep cheaper sellers out.
+- **Remaining trust assumption.** Inside the band any seller of a free mock mint can be paid from the
+  fees. That is inherent to a mock collection anyone can mint. The band limits each payment; it does
+  not make mock NFTs valuable. A live Baazaar integration should keep the band and add a collection
+  allowlist.
+
+### Holder weighting: snapshot of held balances, opt-in, exclusions
+
+- **Snapshot, not live.** A holder's weight in a flip is `min(recorded balance, balance at the commit)`.
+  The recorded balance is what the holder held when they called `enroll()` (or last called `refresh()`).
+  Tokens bought later add nothing until `refresh()`; tokens sold count against the holder at once.
+- **Maturity.** FlipEscrow snapshots with `snapshotFor(purchase block)`: a recorded weight counts only if
+  it was in place `ENROLL_MATURITY_BLOCKS` (300) before the NFT was bought. Raising a weight with
+  `refresh()` restarts its maturity; lowering does not. Buying tokens around the commit transaction and
+  selling them afterwards therefore buys no odds. To gain weight someone has to hold the tokens from an
+  hour before the purchase until the commit, which is holding, not a round trip.
+- **After the commit** nothing changes the table: a holder who sells can still win that flip, a buyer
+  cannot join it.
 - **Opt-in.** Holders call `enroll()` themselves (minimum 1,000 GOTCHI). Contracts that never call it
   (PoolManager, hook, sink, escrow, market) are never candidates.
 - **Excluded always:** zero balances (skipped when the snapshot is built), `0x…dEaD` and `address(0)`
   (cannot enrol). Anyone may `evict` a holder whose balance fell below the minimum.
-- **Bounded.** At most 128 enrolled holders, so a snapshot is one bounded transaction (one storage
-  write per holder). A griefer filling the registry needs 128 × 1,000 GOTCHI held across addresses.
+- **Bounded, not first-come.** At most 128 enrolled holders, so a snapshot is one bounded transaction.
+  When the registry is full, a caller whose balance is strictly larger than the smallest recorded weight
+  displaces that entry, so the registry converges on the 128 largest opted-in holders and dust addresses
+  cannot lock anyone out. Anyone may `trim(holder)` a recorded weight down to the holder's live balance,
+  so a slot cannot be held with tokens that have been sold. A refused enrolment costs constant gas.
+- **Residual griefing.** With a full registry, someone who temporarily holds more than the smallest
+  entry can displace it and then sell. The displaced holder can re-enrol once the intruder is trimmed,
+  but their maturity restarts. Each such displacement costs the attacker a pool round trip (two hook
+  fees) and only ever affects the smallest entries of a full registry.
 - **Deterministic.** `pick` maps `word % totalWeight` onto the cumulative table with a binary search.
+- `snapshot()` (no maturity filter) remains available to anyone for inspection; FlipEscrow never uses it.
 
 ## Events for the UI (indexed fields are stable)
 
@@ -137,7 +192,8 @@ event ListingMocked(uint256 indexed listingId, uint256 tokenId, uint256 price); 
 They are declared once in `src/interfaces/IGotchiEvents.sol`, so each contract's ABI lists all seven;
 the emitter is given above. Supporting events: `SwapFeeSkimmed`, `BuyPoked`, `FeeReceived`,
 `BuyForwarded`, `FlipCommitted`, `FlipTimedOut`, `ListingSold`, `ListingCancelled`, `ProceedsWithdrawn`,
-`HolderEnrolled`, `HolderEvicted`, `SnapshotTaken`, `PoolInitialized`, `LiquiditySeeded`.
+`ListingEvicted`, `HolderEnrolled`, `HolderEvicted`, `HolderDisplaced`, `HolderRefreshed`, `SnapshotTaken`,
+`PoolInitialized`, `PoolRealigned`, `LiquiditySeeded`.
 
 ABIs: `docs/abi/<Contract>.json`.
 
@@ -149,7 +205,7 @@ submodules, no network.
 
 ```sh
 forge build          # solc 0.8.26, evm cancun (v4-core needs transient storage), bytecode_hash = none
-forge test           # 102 tests: 9 suites incl. fuzz, against the real PoolManager
+forge test           # 128 tests: 9 suites incl. fuzz, against the real PoolManager
 forge fmt --check
 EXPECTED_CHAIN_ID=0 forge script script/Deploy.s.sol:Deploy   # local dry run, mines the hook salt
 ```
@@ -159,13 +215,13 @@ Test coverage by requirement:
 | Requirement | Tests |
 | --- | --- |
 | token transfer / supply / weight exclusions | `LaunchToken.t.sol`, `HolderWeightedPicker.t.sol` |
-| fee calculation, hook→sink ETH flow, all four swap shapes, fuzz | `GotchiFeeHook.t.sol` |
-| threshold / no-buy, reentrancy-safe FeeSink | `FeeSink.t.sol` (malicious re-entering market, catching and bubbling) |
-| cheapest listing, seller payment, NFT transfer | `MockBaazaar.t.sol` |
+| fee calculation, hook→sink ETH flow, all four swap shapes, partial fills, in-swap purchase with a full market, fuzz | `GotchiFeeHook.t.sol` |
+| threshold / no-buy, price band, reentrancy-safe FeeSink | `FeeSink.t.sol` (malicious re-entering market, catching and bubbling) |
+| cheapest listing, seller payment, NFT transfer, price floor, eviction when full | `MockBaazaar.t.sol` |
 | forced burn / forced airdrop / timeouts / empty snapshot | `FlipEscrow.t.sol` (block hash steered with `vm.setBlockhash`) |
-| deterministic weighted picker | `HolderWeightedPicker.t.sol` (fuzz against a linear scan) |
+| deterministic weighted picker, displacement, maturity, trim | `HolderWeightedPicker.t.sol` (fuzz against a linear scan) |
 | end-to-end fees → buy → flip with event assertions | `EndToEnd.t.sol` |
-| forever liquidity, price band, refunds | `ForeverLiquidity.t.sol` |
+| forever liquidity, price band, refunds, donations, hostile pre-initialization | `ForeverLiquidity.t.sol` |
 | deployment recipe and hook address mining | `Deployment.t.sol` |
 
 Tests read no environment variables and do not depend on the caller address; they go through the same
@@ -194,6 +250,20 @@ runs the two owner-only wiring calls `escrow.setFeeSink(feeSink)` and `feeSink.s
 otherwise the owner must send them (the script prints a reminder). Until both are done the sink cannot
 register flips and the hook's pokes are rejected (fees still accumulate safely).
 
+**Seeding after a factory launch.** With the default launch split the factory routes 80% of the supply
+to its own unhooked pool and 10% to the swarm, leaving the requester wallet 100,000,000 GOTCHI.
+`SeedPool` pulls `INITIAL_LIQUIDITY_TOKENS` = 50,000,000 GOTCHI and 0.1 ETH from that wallet, which
+fits. To seed deeper, either choose a smaller factory pool share at launch or raise both constants in
+proportion (the ratio sets the price). Only the hooked forever pool feeds `FeeSink`; trades on the
+factory's unhooked launch pool pay no hook fee and trigger no purchases.
+
+**If someone initializes the pool first.** `PoolManager.initialize` is permissionless and the brief
+forbids an initialize gate, so a stranger can open the forever pool key at any price before `SeedPool`
+runs. While that pool is empty, `seed` moves it to the requested opening price itself (a swap on an empty
+pool exchanges nothing) and then adds liquidity, so `SeedPool` works unchanged. If a stranger also added
+liquidity at a price outside the band, `seed` reverts `PriceOutOfBand`; arbitrage against that
+liquidity (or a wider `PRICE_BAND_BPS`) resolves it.
+
 **Hook address.** v4 reads permissions from the hook address, so `GotchiFeeHook` must live at an
 address whose low 14 bits are exactly `0x00CC`; its constructor reverts otherwise. `GotchiHookDeployer`
 mines the CREATE2 salt on-chain (`findSalt`, ~16k keccaks expected) and is the hook's `DEPLOYER`. A
@@ -215,7 +285,8 @@ launch pool (with its `PoolInitializationGuard`) is separate from the hooked for
 | Flipper | commit a fresh secret seed per acquisition promptly, reveal between `commitBlock+2` and `commitBlock+202`. Missing it burns the NFT (anyone can `timeoutBurn`). Never reuse a seed. |
 | Hook deployer owner | run `deploy` once with the mined salt. |
 | Pool seeder | `SeedPool` once; liquidity is unrecoverable by design. |
-| Anyone | `enroll` / `evict`, `list` mock gotchis, `withdrawProceeds`, `timeoutBurn`, add forever liquidity. |
+| Holders | `enroll` at least 300 blocks before the purchases they want to count for; `refresh` after buying more (restarts maturity). |
+| Anyone | `enroll` / `trim` / `evict`, `list` mock gotchis, `withdrawProceeds`, `timeoutBurn`, add forever liquidity. |
 
 ## Known limitations and TODOs
 
@@ -225,9 +296,15 @@ launch pool (with its `PoolInitializationGuard`) is separate from the hooked for
 - **Mock market and NFT.** Later Base / Aavegotchi Diamond / live Baazaar integration is out of scope
   here; the `IMockBaazaar` surface (`cheapest`, `buyCheapest(id, to)`) is the seam to re-implement.
 - **In-swap purchases cost the swapper gas** (bounded by `TRIGGER_GAS`); a swap that triggers a purchase
-  is ~250k gas heavier.
+  is ~250k gas heavier with a few listings and up to ~485k with all 64 slots active.
+- **ETH-specified swaps do not partially fill** (see Fee mechanics); they revert at the price limit.
+- **Mock NFTs are free to mint**, so fees can be spent on worthless listings inside the price band.
+- **Donated or accrued pool fees** are re-donated to the pool on each `seed`; a liquidity provider who
+  adds in-range liquidity just before a `seed` would share in that re-donation.
 - **Stray NFTs** sent straight to `FlipEscrow` outside the sink flow are not tracked and stay there.
 - **Airdrop to contracts** uses `transferFrom` (no receiver check) so a recipient that cannot handle
   ERC-721 cannot block resolution; a contract wallet that enrols must be able to move ERC-721s.
-- **Registry griefing** is bounded, not prevented (see holder weighting).
-- Slither was not available on the build box; `forge lint` ran clean of correctness classes (see `REVIEW.md`).
+- **Registry displacement griefing** on a full registry costs the attacker pool fees and only resets
+  the maturity of the smallest entries (see holder weighting).
+- Slither 0.11.6 was run on this revision: no high-impact findings; one medium (`reentrancy-no-eth` in
+  `FlipEscrow.commit`, which is `nonReentrant` and calls only the immutable picker). See `REVIEW.md`.

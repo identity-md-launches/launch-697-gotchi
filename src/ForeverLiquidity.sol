@@ -12,7 +12,7 @@ import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {Currency} from "v4-core/types/Currency.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
-import {ModifyLiquidityParams} from "v4-core/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "v4-core/types/PoolOperation.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
@@ -26,6 +26,16 @@ import {GotchiConfig} from "./GotchiConfig.sol";
 /// @dev Anyone may `seed` (adding permanent liquidity is a gift to the pool). The caller passes a price
 /// band; if the pool already exists at a price outside the band the call reverts, so a front-run swap on
 /// an empty pool cannot make a seeder deposit at a manipulated price. Unused ETH and tokens are refunded.
+///
+/// Pre-initialized pool. `PoolManager.initialize` is permissionless, so a stranger can open this pool key
+/// first at any price. While the pool holds no liquidity that costs nothing to undo: `seed` moves the
+/// empty pool to `initialSqrtPriceX96` (a swap that exchanges nothing) before adding liquidity. Once the
+/// pool has in-range liquidity the band check alone applies.
+///
+/// Accrued fees. Donations to the pool (and LP fees, if POOL_LP_FEE is ever nonzero) accrue to this
+/// contract's position and are paid out by the PoolManager on the next liquidity change. `seed` donates
+/// them straight back to the pool, so a seeder always pays their own principal in full and never
+/// receives value that accrued to the locked position.
 /// No admin role.
 contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -37,6 +47,7 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
         uint128 liquidity;
         uint256 maxEth;
         uint256 maxTokens;
+        uint160 realignTo;
     }
 
     IPoolManager public immutable POOL_MANAGER;
@@ -54,6 +65,7 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
     event PoolInitialized(PoolId indexed poolId, uint160 sqrtPriceX96, int24 tick);
     event LiquiditySeeded(address indexed seeder, uint128 liquidity, uint256 ethUsed, uint256 tokensUsed);
     event PositionIncreased(uint128 liquidity, BalanceDelta delta, BalanceDelta feesAccrued);
+    event PoolRealigned(uint160 fromSqrtPriceX96, uint160 toSqrtPriceX96);
 
     error ZeroAddress();
     error NotPoolManager();
@@ -62,6 +74,7 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
     error NothingToSeed();
     error RefundFailed();
     error SettleMismatch();
+    error RealignFailed(uint160 current, uint160 target);
 
     constructor(address poolManager, address token, address hook) {
         if (poolManager == address(0) || token == address(0) || hook == address(0)) revert ZeroAddress();
@@ -108,9 +121,14 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
         if (minSqrtPriceX96 > maxSqrtPriceX96) revert InvalidBand();
         PoolKey memory key = poolKey();
         uint160 price = currentSqrtPriceX96();
+        uint160 realignTo = 0;
         if (price < 1) {
             int24 tick = POOL_MANAGER.initialize(key, initialSqrtPriceX96);
             emit PoolInitialized(key.toId(), initialSqrtPriceX96, tick);
+            price = initialSqrtPriceX96;
+        } else if (price != initialSqrtPriceX96 && StateLibrary.getLiquidity(POOL_MANAGER, key.toId()) < 1) {
+            // Opened by someone else and still empty: the callback moves it to the requested price.
+            realignTo = initialSqrtPriceX96;
             price = initialSqrtPriceX96;
         }
         if (price < minSqrtPriceX96 || price > maxSqrtPriceX96) {
@@ -126,7 +144,15 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
         if (liquidity < 1) revert NothingToSeed();
         if (tokenAmount > 0) TOKEN.safeTransferFrom(msg.sender, address(this), tokenAmount);
         bytes memory result = POOL_MANAGER.unlock(
-            abi.encode(SeedData({seeder: msg.sender, liquidity: liquidity, maxEth: msg.value, maxTokens: tokenAmount}))
+            abi.encode(
+                SeedData({
+                    seeder: msg.sender,
+                    liquidity: liquidity,
+                    maxEth: msg.value,
+                    maxTokens: tokenAmount,
+                    realignTo: realignTo
+                })
+            )
         );
         (uint256 ethUsed, uint256 tokensUsed) = abi.decode(result, (uint256, uint256));
         emit LiquiditySeeded(msg.sender, liquidity, ethUsed, tokensUsed);
@@ -145,6 +171,7 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
         SeedData memory seedData = abi.decode(data, (SeedData));
         totalLiquidity += seedData.liquidity;
         PoolKey memory key = poolKey();
+        if (seedData.realignTo != 0) _realign(key, seedData.realignTo);
         (BalanceDelta delta, BalanceDelta feesAccrued) = POOL_MANAGER.modifyLiquidity(
             key,
             ModifyLiquidityParams({
@@ -156,8 +183,17 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
             ""
         );
         emit PositionIncreased(seedData.liquidity, delta, feesAccrued);
-        uint256 ethOwed = delta.amount0() < 0 ? uint256(uint128(-delta.amount0())) : 0;
-        uint256 tokensOwed = delta.amount1() < 0 ? uint256(uint128(-delta.amount1())) : 0;
+        // `delta` is principal plus whatever accrued to the locked position. Give the accrued part back
+        // to the pool, so what is left to settle is exactly the seeder's principal.
+        BalanceDelta owed = delta;
+        if (feesAccrued.amount0() > 0 || feesAccrued.amount1() > 0) {
+            BalanceDelta donated = POOL_MANAGER.donate(
+                key, uint256(uint128(feesAccrued.amount0())), uint256(uint128(feesAccrued.amount1())), ""
+            );
+            owed = delta + donated;
+        }
+        uint256 ethOwed = owed.amount0() < 0 ? uint256(uint128(-owed.amount0())) : 0;
+        uint256 tokensOwed = owed.amount1() < 0 ? uint256(uint128(-owed.amount1())) : 0;
         if (ethOwed > seedData.maxEth || tokensOwed > seedData.maxTokens) revert SettleMismatch();
         if (ethOwed > 0) {
             uint256 paidEth = POOL_MANAGER.settle{value: ethOwed}();
@@ -170,5 +206,22 @@ contract ForeverLiquidity is IUnlockCallback, ReentrancyGuard {
             if (paidTokens != tokensOwed) revert SettleMismatch();
         }
         return abi.encode(ethOwed, tokensOwed);
+    }
+
+    /// @dev Move an EMPTY pool to `target`. With no liquidity the swap exchanges nothing; if it would
+    /// (liquidity appeared out of range), or the price does not land on the target, the seed reverts.
+    /// The token is always the specified currency, so the hook charges no fee on this swap.
+    function _realign(PoolKey memory key, uint160 target) private {
+        uint160 current = currentSqrtPriceX96();
+        bool zeroForOne = target < current;
+        BalanceDelta moved = POOL_MANAGER.swap(
+            key,
+            SwapParams({
+                zeroForOne: zeroForOne, amountSpecified: zeroForOne ? int256(1) : -1, sqrtPriceLimitX96: target
+            }),
+            ""
+        );
+        if (BalanceDelta.unwrap(moved) != 0 || currentSqrtPriceX96() != target) revert RealignFailed(current, target);
+        emit PoolRealigned(current, target);
     }
 }

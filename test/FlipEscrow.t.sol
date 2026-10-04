@@ -238,7 +238,9 @@ contract FlipEscrowTest is GotchiFixture {
         (uint256 id, uint256 tokenId) = _acquire(0.002 ether);
         bytes32 seed = commitAndSteer(id, false);
         // after the commit carol buys a huge stake and enrols: too late for this flip
-        giveAndEnroll(carol, 400_000_000e18);
+        token.transfer(carol, 400_000_000e18);
+        vm.prank(carol);
+        picker.enroll();
         escrow.reveal(id, seed);
         address recipient = escrow.getAcquisition(id).recipient;
         assertTrue(recipient == alice || recipient == bob);
@@ -255,6 +257,35 @@ contract FlipEscrowTest is GotchiFixture {
         escrow.reveal(id2, seed2);
         assertTrue(escrow.getAcquisition(id1).burned);
         assertFalse(escrow.getAcquisition(id2).burned);
+    }
+
+    function test_buyingAroundTheCommitBuysNoOdds() public {
+        // alice (1,000) and bob (3,000) enrolled long ago. bob buys a huge stake right before the commit.
+        (uint256 id,) = _acquire(0.002 ether);
+        token.transfer(bob, 250_000_000e18);
+        escrow.commit(id, escrow.commitmentFor(bytes32("s")));
+        uint256 snapshotId = escrow.getAcquisition(id).snapshotId;
+        assertEq(picker.snapshotInfo(snapshotId).totalWeight, 4_000e18, "bob still weighs his recorded 3,000");
+
+        // refreshing records the new balance, but it only counts for purchases a maturity period later
+        vm.prank(bob);
+        picker.refresh();
+        (uint256 id2,) = _acquire(0.002 ether);
+        escrow.commit(id2, escrow.commitmentFor(bytes32("t")));
+        uint256 snapshot2 = escrow.getAcquisition(id2).snapshotId;
+        assertEq(picker.snapshotInfo(snapshot2).totalWeight, 1_000e18, "bob's raised weight is not mature");
+        assertEq(picker.snapshotInfo(snapshot2).entryCount, 1);
+    }
+
+    function test_holderEnrolledAfterThePurchaseCarriesNoWeightInItsFlip() public {
+        (uint256 id,) = _acquire(0.002 ether);
+        token.transfer(carol, 400_000_000e18);
+        vm.prank(carol);
+        picker.enroll();
+        vm.roll(block.number + picker.ENROLL_MATURITY_BLOCKS());
+        escrow.commit(id, escrow.commitmentFor(bytes32("s")));
+        uint256 snapshotId = escrow.getAcquisition(id).snapshotId;
+        assertEq(picker.snapshotInfo(snapshotId).totalWeight, 4_000e18, "only weight recorded before the purchase");
     }
 
     // ---- timeouts ----
