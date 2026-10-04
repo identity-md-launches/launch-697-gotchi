@@ -10,6 +10,9 @@ import {IMockBaazaar} from "../../src/interfaces/IMockBaazaar.sol";
 /// @notice Ordering, bookkeeping and hostile-counterparty edges of MockBaazaar.
 contract MockBaazaarEdgeTest is Test {
     event ListingMocked(uint256 indexed listingId, uint256 tokenId, uint256 price);
+    event ListingEvicted(uint256 indexed listingId, uint256 tokenId, uint256 indexed byListingId);
+
+    uint256 internal constant FLOOR = 0.001 ether; // MIN_LIST_PRICE
 
     MockGotchiNFT internal nft;
     MockBaazaar internal market;
@@ -35,13 +38,26 @@ contract MockBaazaarEdgeTest is Test {
 
     // ---- list ----
 
-    function test_oneWeiListingIsAllowedAndZeroIsNot() public {
-        (uint256 id,) = _list(seller, 1);
+    function test_floorPriceIsAllowedAndBelowFloorZeroAndAboveUint192AreNot() public {
+        (uint256 id,) = _list(seller, FLOOR);
         assertEq(market.cheapest().listingId, id);
+        (uint256 top,) = _list(seller, type(uint192).max); // the largest price the packed key can hold
+        assertEq(market.getListing(top).price, type(uint192).max);
+        assertEq(market.cheapest().listingId, id, "the floor listing stays cheapest");
+
         uint256 tokenId = nft.mint(seller);
-        vm.prank(seller);
+        vm.startPrank(seller);
+        vm.expectRevert(MockBaazaar.InvalidPrice.selector);
+        market.list(tokenId, FLOOR - 1);
         vm.expectRevert(MockBaazaar.InvalidPrice.selector);
         market.list(tokenId, 0);
+        vm.expectRevert(MockBaazaar.InvalidPrice.selector);
+        market.list(tokenId, uint256(type(uint192).max) + 1);
+        vm.expectRevert(MockBaazaar.InvalidPrice.selector);
+        market.list(tokenId, type(uint256).max);
+        vm.stopPrank();
+        assertEq(market.activeCount(), 2);
+        assertEq(market.nextListingId(), 3, "refused listings consume no id");
     }
 
     function test_failedListLeavesNoTrace() public {
@@ -79,27 +95,124 @@ contract MockBaazaarEdgeTest is Test {
         market.list(tokenId, 7 ether);
     }
 
-    function test_capFreesUpAfterASaleOrCancel() public {
+    function test_fullMarketEvictsOnlyForAStrictlyCheaperListing() public {
         uint256 cap = market.MAX_ACTIVE_LISTINGS();
         uint256 firstId;
+        uint256 dearestId;
+        uint256 dearestToken;
         for (uint256 i = 0; i < cap; ++i) {
-            (uint256 id,) = _list(seller, 1 ether + i);
+            (uint256 id, uint256 tokenId) = _list(i == cap - 1 ? other : seller, 1 ether + i);
             if (i == 0) firstId = id;
+            if (i == cap - 1) (dearestId, dearestToken) = (id, tokenId);
         }
         uint256 extra = nft.mint(seller);
-        vm.prank(seller);
+        vm.startPrank(seller);
         vm.expectRevert(MockBaazaar.MarketFull.selector);
-        market.list(extra, 1 ether);
+        market.list(extra, 1 ether + cap - 1); // equal to the most expensive: not strictly cheaper
+        vm.expectRevert(MockBaazaar.MarketFull.selector);
+        market.list(extra, 10 ether);
+        assertEq(market.nextListingId(), cap + 1, "refused listings consume no id");
 
+        // one wei cheaper than the dearest: it takes the dearest's slot and the NFT goes home
+        vm.expectEmit(true, true, false, true, address(market));
+        emit ListingEvicted(dearestId, dearestToken, cap + 1);
+        uint256 newId = market.list(extra, 1 ether + cap - 2);
+        vm.stopPrank();
+        assertEq(newId, cap + 1);
+        assertEq(market.activeCount(), cap);
+        assertFalse(market.getListing(dearestId).active);
+        assertTrue(market.getListing(newId).active);
+        assertEq(nft.ownerOf(dearestToken), other, "evicted NFT returned to its seller");
+        assertEq(nft.ownerOf(extra), address(market));
+        assertEq(market.proceeds(other), 0, "eviction pays nobody");
+        for (uint256 i = 0; i < cap; ++i) {
+            assertTrue(market.activeIdAt(i) != dearestId, "evicted id still in the active set");
+        }
+        vm.prank(other);
+        vm.expectRevert(MockBaazaar.NoListings.selector);
+        market.cancel(dearestId);
+
+        // a cancel frees a slot, after which even a dearer listing fits without evicting anyone
         vm.prank(seller);
         market.cancel(firstId);
+        uint256 dear = nft.mint(seller);
         vm.prank(seller);
-        market.list(extra, 1 ether);
+        market.list(dear, 10 ether);
         assertEq(market.activeCount(), cap);
+        assertTrue(market.getListing(newId).active, "nothing evicted when a slot was free");
 
         vm.prank(buyer);
-        market.buyCheapest{value: 1 ether}(market.cheapest().listingId, buyer);
+        market.buyCheapest{value: 1 ether + 1}(market.cheapest().listingId, buyer);
         assertEq(market.activeCount(), cap - 1);
+    }
+
+    function test_evictionTieGoesToTheNewestOfTheDearest() public {
+        uint256 cap = market.MAX_ACTIVE_LISTINGS();
+        for (uint256 i = 0; i < cap - 2; ++i) {
+            _list(seller, 1 ether);
+        }
+        (uint256 olderDear, uint256 olderToken) = _list(seller, 3 ether);
+        (uint256 newerDear, uint256 newerToken) = _list(other, 3 ether);
+        (uint256 a,) = _list(seller, 2 ether);
+        assertFalse(market.getListing(newerDear).active, "newest of the tied dearest goes first");
+        assertTrue(market.getListing(olderDear).active);
+        assertEq(nft.ownerOf(newerToken), other);
+        (uint256 b,) = _list(other, 2 ether - 1);
+        assertFalse(market.getListing(olderDear).active, "then the older one");
+        assertEq(nft.ownerOf(olderToken), seller);
+        assertTrue(market.getListing(a).active && market.getListing(b).active);
+        // now the dearest is `a` at 2 ETH; an equal price is refused, the evicted seller may come back cheaper
+        uint256 again = nft.mint(other);
+        vm.startPrank(other);
+        vm.expectRevert(MockBaazaar.MarketFull.selector);
+        market.list(again, 2 ether);
+        uint256 back = market.list(again, 1.5 ether);
+        vm.stopPrank();
+        assertFalse(market.getListing(a).active);
+        assertTrue(market.getListing(back).active);
+        assertEq(market.activeCount(), cap);
+    }
+
+    function test_evictedSellerCanBeTheListerThemself() public {
+        uint256 cap = market.MAX_ACTIVE_LISTINGS();
+        for (uint256 i = 0; i < cap - 1; ++i) {
+            _list(seller, 1 ether);
+        }
+        (uint256 dear, uint256 dearToken) = _list(seller, 5 ether);
+        (, uint256 cheapToken) = _list(seller, FLOOR);
+        assertFalse(market.getListing(dear).active);
+        assertEq(nft.ownerOf(dearToken), seller, "the seller got their own dear NFT back");
+        assertEq(nft.ownerOf(cheapToken), address(market));
+        assertEq(nft.balanceOf(address(market)), cap);
+        assertEq(market.cheapest().tokenId, cheapToken);
+    }
+
+    /// A full market whose every slot sits at the floor admits nothing new until something sells or is
+    /// cancelled: nothing can be strictly cheaper than the floor. Recorded as a limitation (see the
+    /// findings file); this only pins the escape hatches, not the freeze itself.
+    function test_floorFilledMarketUnfreezesThroughSalesAndCancels() public {
+        uint256 cap = market.MAX_ACTIVE_LISTINGS();
+        uint256 lastId;
+        for (uint256 i = 0; i < cap; ++i) {
+            (lastId,) = _list(other, FLOOR);
+        }
+        uint256 mine = nft.mint(seller);
+        vm.prank(seller);
+        vm.expectRevert(MockBaazaar.MarketFull.selector);
+        market.list(mine, FLOOR);
+
+        vm.prank(buyer);
+        market.buyCheapest{value: FLOOR}(market.cheapest().listingId, buyer);
+        vm.prank(seller);
+        uint256 id = market.list(mine, FLOOR);
+        assertTrue(market.getListing(id).active);
+
+        vm.prank(other);
+        market.cancel(lastId);
+        uint256 another = nft.mint(seller);
+        vm.prank(seller);
+        market.list(another, 1 ether);
+        assertEq(market.activeCount(), cap);
     }
 
     // ---- cancel ----
@@ -297,7 +410,7 @@ contract MockBaazaarEdgeTest is Test {
         uint256[12] memory ids;
         bool[12] memory live;
         for (uint256 i = 0; i < 12; ++i) {
-            prices[i] = bound(prices[i], 1, 5); // narrow range: plenty of ties
+            prices[i] = bound(prices[i], FLOOR, FLOOR + 4); // narrow range: plenty of ties
             (ids[i],) = _list(i % 2 == 0 ? seller : other, prices[i]);
             live[i] = true;
         }
@@ -343,7 +456,7 @@ contract MockBaazaarEdgeTest is Test {
 
     /// forge-config: default.fuzz.runs = 300
     function testFuzz_sellerIsCreditedExactlyWhatWasSent(uint256 price, uint256 extra) public {
-        price = bound(price, 1, 50 ether);
+        price = bound(price, FLOOR, 50 ether);
         extra = bound(extra, 0, 50 ether);
         (uint256 id, uint256 tokenId) = _list(seller, price);
         vm.prank(buyer);
@@ -354,6 +467,65 @@ contract MockBaazaarEdgeTest is Test {
         market.withdrawProceeds();
         assertEq(seller.balance, price + extra);
         assertEq(address(market).balance, 0);
+    }
+
+    /// With the market full, every new listing either evicts exactly the model's "most expensive, newest
+    /// on a tie" entry or is refused with MarketFull; the active set and `cheapest()` track the model.
+    /// forge-config: default.fuzz.runs = 150
+    function testFuzz_fullMarketEvictionFollowsTheModel(uint256 seed, uint8 rounds) public {
+        uint256 cap = market.MAX_ACTIVE_LISTINGS();
+        uint256[] memory ids = new uint256[](cap);
+        uint256[] memory prices = new uint256[](cap);
+        uint256[] memory tokens = new uint256[](cap);
+        address[] memory sellers = new address[](cap);
+        for (uint256 i = 0; i < cap; ++i) {
+            prices[i] = FLOOR + bound(uint256(keccak256(abi.encode(seed, "p", i))), 0, 6);
+            sellers[i] = i % 3 == 0 ? other : seller;
+            (ids[i], tokens[i]) = _list(sellers[i], prices[i]);
+        }
+        rounds = uint8(bound(rounds, 1, 24));
+        for (uint256 r = 0; r < rounds; ++r) {
+            uint256 price = FLOOR + bound(uint256(keccak256(abi.encode(seed, "n", r))), 0, 6);
+            // model: the slot that goes is the highest price, highest id on a tie
+            uint256 victim = 0;
+            for (uint256 i = 1; i < cap; ++i) {
+                if (prices[i] > prices[victim] || (prices[i] == prices[victim] && ids[i] > ids[victim])) victim = i;
+            }
+            address lister = r % 2 == 0 ? seller : other;
+            uint256 tokenId = nft.mint(lister);
+            uint256 nextId = market.nextListingId();
+            vm.prank(lister);
+            if (price >= prices[victim]) {
+                vm.expectRevert(MockBaazaar.MarketFull.selector);
+                market.list(tokenId, price);
+                assertEq(market.nextListingId(), nextId);
+                continue;
+            }
+            uint256 newId = market.list(tokenId, price);
+            assertEq(newId, nextId);
+            assertFalse(market.getListing(ids[victim]).active, "model victim still active");
+            assertEq(nft.ownerOf(tokens[victim]), sellers[victim], "victim's NFT not returned");
+            ids[victim] = newId;
+            prices[victim] = price;
+            tokens[victim] = tokenId;
+            sellers[victim] = lister;
+            assertEq(market.activeCount(), cap);
+        }
+        // the live active set equals the model, and cheapest is the model minimum (lowest id on a tie)
+        uint256 best = 0;
+        for (uint256 i = 0; i < cap; ++i) {
+            if (prices[i] < prices[best] || (prices[i] == prices[best] && ids[i] < ids[best])) best = i;
+            IMockBaazaar.Listing memory l = market.getListing(ids[i]);
+            assertTrue(l.active);
+            assertEq(l.price, prices[i]);
+            assertEq(l.seller, sellers[i]);
+            assertEq(nft.ownerOf(tokens[i]), address(market));
+        }
+        IMockBaazaar.Listing memory c = market.cheapest();
+        assertEq(c.listingId, ids[best]);
+        assertEq(c.price, prices[best]);
+        assertEq(nft.balanceOf(address(market)), cap);
+        assertEq(address(market).balance, 0, "eviction moves no ETH");
     }
 }
 

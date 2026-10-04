@@ -7,6 +7,7 @@ import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {SwapParams} from "v4-core/types/PoolOperation.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {SqrtPriceMath} from "v4-core/libraries/SqrtPriceMath.sol";
 import {LaunchToken} from "../../src/LaunchToken.sol";
 import {MockGotchiNFT} from "../../src/MockGotchiNFT.sol";
 import {MockBaazaar} from "../../src/MockBaazaar.sol";
@@ -39,9 +40,12 @@ contract SystemHandler is Test {
 
     address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
     uint256 internal constant THRESHOLD = 0.01 ether;
+    uint256 internal constant FLOOR = 0.001 ether; // MIN_LIST_PRICE == MIN_BUY_PRICE
+    uint256 internal constant CEILING = 0.05 ether; // MAX_BUY_PRICE
     uint256 internal constant MIN_ENROLL = 1_000e18;
     uint256 internal constant MAX_HOLDERS = 128;
     uint256 internal constant MAX_LISTINGS = 64;
+    uint256 internal constant MATURITY = 300;
 
     Refs internal r;
     PoolKey internal key;
@@ -56,6 +60,9 @@ contract SystemHandler is Test {
     uint256 public ghostAirdrops;
     uint256 public ghostTimeouts;
     uint256 public ghostSwaps;
+    uint256 public ghostPartialFills; // token-specified swaps that stopped at their limit
+    uint256 public ghostRefusedPartials; // ETH-specified swaps refused at their limit
+    uint256 public ghostEvictions; // listings displaced by a cheaper one on a full market
     uint256 public ghostLiquidityFloor; // forever liquidity never drops below this
     mapping(uint256 acquisitionId => bytes32 seed) public seedOf;
     mapping(uint256 acquisitionId => bool resolved) public ghostResolved;
@@ -94,6 +101,34 @@ contract SystemHandler is Test {
         return (amount * 30) / 10_000;
     }
 
+    /// @dev True when the 4-byte `selector` appears anywhere in `reason` (v4 wraps hook reverts twice).
+    function _contains(bytes memory reason, bytes4 selector) internal pure returns (bool) {
+        for (uint256 i = 0; i + 4 <= reason.length; ++i) {
+            if (
+                reason[i] == selector[0] && reason[i + 1] == selector[1] && reason[i + 2] == selector[2]
+                    && reason[i + 3] == selector[3]
+            ) return true;
+        }
+        return false;
+    }
+
+    /// @dev One swap pokes the sink once, so it buys at most one NFT, inside the price band and within
+    /// what the sink held.
+    function _checkInSwapPurchase(uint256 buysBefore, uint256 spentBefore, uint256 sinkBefore, uint256 fee)
+        internal
+        view
+    {
+        uint256 buys = r.feeSink.buyCount() - buysBefore;
+        assertLe(buys, 1, "a swap bought more than one NFT");
+        if (buys == 1) {
+            uint256 price = r.feeSink.totalSpent() - spentBefore;
+            assertGe(price, FLOOR, "in-swap purchase below the floor");
+            assertLe(price, CEILING, "in-swap purchase above the ceiling");
+            assertLe(price, sinkBefore + fee, "in-swap purchase spent more than the sink held");
+            assertGe(sinkBefore + fee, THRESHOLD, "in-swap purchase below the threshold");
+        }
+    }
+
     // ---------------------------------------------------------------- swaps
 
     /// ETH exact-in: the fee is 30 bps of the ETH the swapper sends, and they pay exactly `ethIn`.
@@ -104,14 +139,73 @@ contract SystemHandler is Test {
         uint256 feesBefore = r.hook.totalFeesCollected();
         uint256 receivedBefore = r.feeSink.totalReceived();
         uint256 ethBefore = a.balance;
+        (uint256 buysBefore, uint256 spentBefore, uint256 sinkBefore) =
+            (r.feeSink.buyCount(), r.feeSink.totalSpent(), address(r.feeSink).balance);
         vm.prank(a);
         r.router.swap{value: ethIn}(key, SwapParams(true, -int256(ethIn), TickMath.MIN_SQRT_PRICE + 1));
         uint256 fee = r.hook.totalFeesCollected() - feesBefore;
         assertEq(fee, _bps30(ethIn), "exact ETH in: fee is 30 bps of the input");
         assertEq(r.feeSink.totalReceived() - receivedBefore, fee, "exact ETH in: sink received the fee");
         assertEq(ethBefore - a.balance, ethIn, "exact ETH in: swapper paid exactly the input");
+        _checkInSwapPurchase(buysBefore, spentBefore, sinkBefore, fee);
         ghostFees += fee;
         ghostSwaps += 1;
+    }
+
+    /// Token exact-in that stops at a price limit: the fee is 30 bps of the ETH that actually left the pool.
+    function partialTokenExactIn(uint256 actorSeed, uint256 delta, uint256 tokensIn) external {
+        address a = _actor(actorSeed);
+        uint256 balance = r.token.balanceOf(a);
+        if (balance < 1000) return;
+        uint160 current = r.forever.currentSqrtPriceX96();
+        uint160 limit = uint160(uint256(current) + bound(delta, 1, uint256(current) / 8));
+        tokensIn = bound(tokensIn, 1000, balance);
+        uint256 feesBefore = r.hook.totalFeesCollected();
+        uint256 ethBefore = a.balance;
+        uint256 poolBefore = address(r.manager).balance;
+        (uint256 buysBefore, uint256 spentBefore, uint256 sinkBefore) =
+            (r.feeSink.buyCount(), r.feeSink.totalSpent(), address(r.feeSink).balance);
+        vm.prank(a);
+        r.router.swap(key, SwapParams(false, -int256(tokensIn), limit));
+        uint256 fee = r.hook.totalFeesCollected() - feesBefore;
+        uint256 consumed = balance - r.token.balanceOf(a);
+        uint256 poolLeg = poolBefore - address(r.manager).balance;
+        assertLe(consumed, tokensIn, "partial token in: consumed more than offered");
+        assertEq(fee, _bps30(poolLeg), "partial token in: fee is 30 bps of the realised ETH leg");
+        assertEq(a.balance - ethBefore, poolLeg - fee, "partial token in: swapper got the leg minus the fee");
+        assertLe(r.forever.currentSqrtPriceX96(), limit, "partial token in: price beyond the limit");
+        _checkInSwapPurchase(buysBefore, spentBefore, sinkBefore, fee);
+        if (consumed < tokensIn) ghostPartialFills += 1;
+        ghostFees += fee;
+        ghostSwaps += 1;
+    }
+
+    /// ETH exact-in that would stop at a price limit is refused as a whole and leaves no trace.
+    function partialEthExactIn(uint256 actorSeed, uint256 delta, uint256 extra) external {
+        address a = _actor(actorSeed);
+        uint160 current = r.forever.currentSqrtPriceX96();
+        uint160 limit = uint160(uint256(current) - bound(delta, 1, uint256(current) / 8));
+        uint256 needed = SqrtPriceMath.getAmount0Delta(limit, current, r.forever.totalLiquidity(), true);
+        uint256 ethIn = ((needed + bound(extra, 1000, 0.2 ether)) * 10_000) / 9_970 + 2;
+        if (a.balance < ethIn) return;
+        uint256 feesBefore = r.hook.totalFeesCollected();
+        uint256 receivedBefore = r.feeSink.totalReceived();
+        uint256 buysBefore = r.feeSink.buyCount();
+        uint256 ethBefore = a.balance;
+        uint256 tokensBefore = r.token.balanceOf(a);
+        vm.prank(a);
+        try r.router.swap{value: ethIn}(key, SwapParams(true, -int256(ethIn), limit)) {
+            fail("partial ETH in: must revert");
+        } catch (bytes memory reason) {
+            assertTrue(_contains(reason, GotchiFeeHook.PartialFillUnsupported.selector), "partial ETH in: reason");
+        }
+        assertEq(r.hook.totalFeesCollected(), feesBefore, "partial ETH in: fee kept");
+        assertEq(r.feeSink.totalReceived(), receivedBefore, "partial ETH in: sink received");
+        assertEq(r.feeSink.buyCount(), buysBefore, "partial ETH in: a purchase survived the revert");
+        assertEq(a.balance, ethBefore, "partial ETH in: swapper lost ETH");
+        assertEq(r.token.balanceOf(a), tokensBefore);
+        assertEq(r.forever.currentSqrtPriceX96(), current, "partial ETH in: price moved");
+        ghostRefusedPartials += 1;
     }
 
     /// Token exact-out bought with ETH: the fee is charged on top of the ETH the pool takes.
@@ -123,6 +217,8 @@ contract SystemHandler is Test {
         uint256 receivedBefore = r.feeSink.totalReceived();
         uint256 ethBefore = a.balance;
         uint256 tokensBefore = r.token.balanceOf(a);
+        (uint256 buysBefore, uint256 spentBefore, uint256 sinkBefore) =
+            (r.feeSink.buyCount(), r.feeSink.totalSpent(), address(r.feeSink).balance);
         vm.prank(a);
         try r.router.swap{value: ethBefore}(key, SwapParams(true, int256(tokensOut), TickMath.MIN_SQRT_PRICE + 1)) {}
         catch {
@@ -133,6 +229,7 @@ contract SystemHandler is Test {
         assertEq(r.token.balanceOf(a) - tokensBefore, tokensOut, "exact tokens out: delivered exactly");
         assertEq(fee, _bps30(paid - fee), "exact tokens out: fee is 30 bps of the pool's ETH leg");
         assertEq(r.feeSink.totalReceived() - receivedBefore, fee, "exact tokens out: sink received the fee");
+        _checkInSwapPurchase(buysBefore, spentBefore, sinkBefore, fee);
         ghostFees += fee;
         ghostSwaps += 1;
     }
@@ -146,6 +243,8 @@ contract SystemHandler is Test {
         uint256 feesBefore = r.hook.totalFeesCollected();
         uint256 receivedBefore = r.feeSink.totalReceived();
         uint256 ethBefore = a.balance;
+        (uint256 buysBefore, uint256 spentBefore, uint256 sinkBefore) =
+            (r.feeSink.buyCount(), r.feeSink.totalSpent(), address(r.feeSink).balance);
         vm.prank(a);
         r.router.swap(key, SwapParams(false, -int256(tokensIn), TickMath.MAX_SQRT_PRICE - 1));
         uint256 fee = r.hook.totalFeesCollected() - feesBefore;
@@ -153,6 +252,7 @@ contract SystemHandler is Test {
         assertEq(balance - r.token.balanceOf(a), tokensIn, "exact tokens in: paid exactly");
         assertEq(fee, _bps30(got + fee), "exact tokens in: fee is 30 bps of the pool's ETH leg");
         assertEq(r.feeSink.totalReceived() - receivedBefore, fee, "exact tokens in: sink received the fee");
+        _checkInSwapPurchase(buysBefore, spentBefore, sinkBefore, fee);
         ghostFees += fee;
         ghostSwaps += 1;
     }
@@ -164,6 +264,8 @@ contract SystemHandler is Test {
         uint256 feesBefore = r.hook.totalFeesCollected();
         uint256 receivedBefore = r.feeSink.totalReceived();
         uint256 ethBefore = a.balance;
+        (uint256 buysBefore, uint256 spentBefore, uint256 sinkBefore) =
+            (r.feeSink.buyCount(), r.feeSink.totalSpent(), address(r.feeSink).balance);
         vm.prank(a);
         try r.router.swap(key, SwapParams(false, int256(ethOut), TickMath.MAX_SQRT_PRICE - 1)) {}
         catch {
@@ -173,6 +275,7 @@ contract SystemHandler is Test {
         assertEq(a.balance - ethBefore, ethOut, "exact ETH out: delivered exactly");
         assertEq(fee, _bps30(ethOut), "exact ETH out: fee is 30 bps of the output");
         assertEq(r.feeSink.totalReceived() - receivedBefore, fee, "exact ETH out: sink received the fee");
+        _checkInSwapPurchase(buysBefore, spentBefore, sinkBefore, fee);
         ghostFees += fee;
         ghostSwaps += 1;
     }
@@ -189,11 +292,12 @@ contract SystemHandler is Test {
         ghostDonated += amount;
     }
 
-    /// The owner's manual trigger buys exactly when balance >= 0.01 ETH and the cheapest listing is affordable.
+    /// The owner's manual trigger buys exactly when balance >= 0.01 ETH and the cheapest listing is inside
+    /// the [0.001, 0.05] ETH band and affordable.
     function keeperTryBuy() external {
         uint256 balance = address(r.feeSink).balance;
         IMockBaazaar.Listing memory c = r.market.cheapest();
-        bool expected = balance >= THRESHOLD && c.active && c.price <= balance;
+        bool expected = balance >= THRESHOLD && c.active && c.price <= balance && c.price >= FLOOR && c.price <= CEILING;
         uint256 buysBefore = r.feeSink.buyCount();
         uint256 creditBefore = r.market.proceeds(c.seller);
         vm.prank(r.owner);
@@ -219,11 +323,35 @@ contract SystemHandler is Test {
 
     // ---------------------------------------------------------------- market
 
+    /// Prices from the floor up to 0.03 ETH.
     function list(uint256 actorSeed, uint256 price) external {
         address a = _actor(actorSeed);
-        price = bound(price, 1, 0.03 ether);
+        _list(a, r.nft.mint(a), bound(price, FLOOR, 0.03 ether));
+    }
+
+    /// Prices within a few wei of the floor: plenty of ties for `cheapest()` and eviction ordering.
+    function listNearFloor(uint256 actorSeed, uint256 offset) external {
+        address a = _actor(actorSeed);
+        _list(a, r.nft.mint(a), FLOOR + bound(offset, 0, 5));
+    }
+
+    /// Prices above the sink's ceiling: listable, never bought by the sink, evictable by anything cheaper.
+    function listAboveCeiling(uint256 actorSeed, uint256 price) external {
+        address a = _actor(actorSeed);
+        _list(a, r.nft.mint(a), bound(price, CEILING + 1, 1 ether));
+    }
+
+    /// Below the floor nothing can be listed, whoever asks, and no id or NFT moves.
+    function listBelowFloor(uint256 actorSeed, uint256 price) external {
+        address a = _actor(actorSeed);
+        price = bound(price, 0, FLOOR - 1);
         uint256 tokenId = r.nft.mint(a);
-        _list(a, tokenId, price);
+        uint256 nextBefore = r.market.nextListingId();
+        vm.prank(a);
+        vm.expectRevert(MockBaazaar.InvalidPrice.selector);
+        r.market.list(tokenId, price);
+        assertEq(r.nft.ownerOf(tokenId), a);
+        assertEq(r.market.nextListingId(), nextBefore);
     }
 
     /// An airdrop winner lists the NFT they received, so the same token id can be bought again.
@@ -232,22 +360,49 @@ contract SystemHandler is Test {
         uint256 tokenId = _airdroppedTokens[index % _airdroppedTokens.length];
         address owner = r.nft.ownerOf(tokenId);
         if (owner == address(r.market) || owner == address(r.escrow) || owner == DEAD) return;
-        _list(owner, tokenId, bound(price, 1, 0.03 ether));
+        _list(owner, tokenId, bound(price, FLOOR, 0.03 ether));
+    }
+
+    /// @dev The listing a full market would evict: highest price, highest id on a tie.
+    function _mostExpensive() internal view returns (IMockBaazaar.Listing memory dearest) {
+        uint256 active = r.market.activeCount();
+        for (uint256 i = 0; i < active; ++i) {
+            IMockBaazaar.Listing memory l = r.market.getListing(r.market.activeIdAt(i));
+            if (i == 0 || l.price > dearest.price || (l.price == dearest.price && l.listingId > dearest.listingId)) {
+                dearest = l;
+            }
+        }
     }
 
     function _list(address a, uint256 tokenId, uint256 price) internal {
         uint256 active = r.market.activeCount();
         uint256 expectedId = r.market.nextListingId();
-        vm.prank(a);
+        IMockBaazaar.Listing memory victim;
+        bool evicts = false;
         if (active >= MAX_LISTINGS) {
-            vm.expectRevert(MockBaazaar.MarketFull.selector);
-            r.market.list(tokenId, price);
-            return;
+            victim = _mostExpensive();
+            if (price >= victim.price) {
+                vm.prank(a);
+                vm.expectRevert(MockBaazaar.MarketFull.selector);
+                r.market.list(tokenId, price);
+                assertEq(r.market.nextListingId(), expectedId, "refused listing consumed an id");
+                assertEq(r.nft.ownerOf(tokenId), a);
+                return;
+            }
+            evicts = true;
         }
+        vm.prank(a);
         uint256 id = r.market.list(tokenId, price);
         assertEq(id, expectedId, "listing ids are sequential");
         assertEq(r.nft.ownerOf(tokenId), address(r.market), "listed NFT is escrowed by the market");
-        assertEq(r.market.activeCount(), active + 1);
+        if (evicts) {
+            assertEq(r.market.activeCount(), active, "eviction keeps the market full");
+            assertFalse(r.market.getListing(victim.listingId).active, "the dearest listing survived");
+            assertEq(r.nft.ownerOf(victim.tokenId), victim.seller, "evicted NFT not returned to its seller");
+            ghostEvictions += 1;
+        } else {
+            assertEq(r.market.activeCount(), active + 1);
+        }
     }
 
     function cancel(uint256 index) external {
@@ -454,15 +609,62 @@ contract SystemHandler is Test {
 
     function enroll(uint256 actorSeed) external {
         address a = _actor(actorSeed);
-        bool expected =
-            !r.picker.isEnrolled(a) && r.token.balanceOf(a) >= MIN_ENROLL && r.picker.holderCount() < MAX_HOLDERS;
+        uint256 balance = r.token.balanceOf(a);
+        (uint256 lowestWeight,) = r.picker.registrationOf(r.picker.lowestHolder());
+        bool expected = !r.picker.isEnrolled(a) && balance >= MIN_ENROLL
+            && (r.picker.holderCount() < MAX_HOLDERS || balance > lowestWeight);
         vm.prank(a);
         try r.picker.enroll() {
             assertTrue(expected, "enroll succeeded for an ineligible caller");
             assertTrue(r.picker.isEnrolled(a));
+            (uint256 weight, uint256 since) = r.picker.registrationOf(a);
+            assertEq(weight, balance, "enroll records the live balance");
+            assertEq(since, vm.getBlockNumber(), "enroll starts maturity now");
         } catch {
             assertFalse(expected, "enroll reverted for an eligible caller");
         }
+    }
+
+    /// Refresh re-records the balance; raising it restarts maturity, lowering it keeps it.
+    function refresh(uint256 actorSeed) external {
+        address a = _actor(actorSeed);
+        uint256 balance = r.token.balanceOf(a);
+        bool enrolled = r.picker.isEnrolled(a);
+        (uint256 weightBefore, uint256 sinceBefore) = r.picker.registrationOf(a);
+        bool expected = enrolled && balance >= MIN_ENROLL;
+        vm.prank(a);
+        try r.picker.refresh() {
+            assertTrue(expected, "refresh succeeded for an ineligible caller");
+            (uint256 weight, uint256 since) = r.picker.registrationOf(a);
+            assertEq(weight, balance, "refresh records the live balance");
+            assertEq(since, balance > weightBefore ? vm.getBlockNumber() : sinceBefore, "maturity rule");
+        } catch {
+            assertFalse(expected, "refresh reverted for an eligible caller");
+        }
+    }
+
+    /// Anyone may trim a recorded weight down to the live balance, never up, never touching maturity.
+    function trim(uint256 actorSeed, uint256 targetSeed) external {
+        address target = _actor(targetSeed);
+        uint256 balance = r.token.balanceOf(target);
+        (uint256 weightBefore, uint256 sinceBefore) = r.picker.registrationOf(target);
+        bool expected = r.picker.isEnrolled(target) && balance < weightBefore;
+        vm.prank(_actor(actorSeed));
+        try r.picker.trim(target) {
+            assertTrue(expected, "trim succeeded although nothing was stale");
+            (uint256 weight, uint256 since) = r.picker.registrationOf(target);
+            assertEq(weight, balance, "trim records the live balance");
+            assertEq(since, sinceBefore, "trim touched maturity");
+            assertTrue(r.picker.isEnrolled(target), "trim evicted");
+        } catch {
+            assertFalse(expected, "trim reverted on a stale weight");
+        }
+    }
+
+    /// Occasionally jump past the maturity period so recorded weights start counting in flips.
+    function rollPastMaturity(uint256 gate) external {
+        if (gate % 8 != 0) return;
+        vm.roll(vm.getBlockNumber() + MATURITY + 1);
     }
 
     function evict(uint256 actorSeed, uint256 targetSeed) external {

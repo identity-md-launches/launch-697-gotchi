@@ -287,6 +287,84 @@ contract FlipEscrowEdgeTest is GotchiFixture {
         assertEq(escrow.acquisitionCount(), 1);
     }
 
+    // ---- maturity on the purchase path ----
+
+    /// A holder whose weight was recorded exactly ENROLL_MATURITY_BLOCKS before the purchase block counts
+    /// in that purchase's flip; one block later does not. The commit block is irrelevant.
+    function test_maturityIsMeasuredAgainstThePurchaseBlockNotTheCommitBlock() public {
+        token.transfer(carol, 1_000_000e18);
+        vm.prank(carol);
+        picker.enroll();
+        uint256 enrolBlock = block.number;
+        uint256 maturity = picker.ENROLL_MATURITY_BLOCKS();
+
+        vm.roll(enrolBlock + maturity - 1);
+        (uint256 early,) = _acquire(); // purchased one block short of carol's maturity
+        vm.roll(enrolBlock + maturity);
+        (uint256 onTime,) = _acquire(); // purchased exactly at maturity
+
+        vm.roll(block.number + 10_000); // committing much later changes nothing
+        escrow.commit(early, keccak256("e"));
+        escrow.commit(onTime, keccak256("o"));
+        uint256 earlySnap = escrow.getAcquisition(early).snapshotId;
+        uint256 onTimeSnap = escrow.getAcquisition(onTime).snapshotId;
+        assertEq(picker.snapshotInfo(earlySnap).totalWeight, 4_000e18, "only alice and bob count");
+        assertEq(picker.snapshotInfo(earlySnap).entryCount, 2);
+        assertEq(picker.snapshotInfo(onTimeSnap).totalWeight, 1_004_000e18, "carol counts at maturity");
+        assertEq(picker.snapshotInfo(onTimeSnap).entryCount, 3);
+        (address w,) = picker.pick(onTimeSnap, 4_000e18); // first unit past alice and bob
+        assertEq(w, carol);
+    }
+
+    /// When every enrolled holder is immature (or empty) at the purchase block the airdrop branch has
+    /// nobody to pay and the flip burns, with the burn events and a burn-address recipient.
+    function test_airdropCoinWithOnlyImmatureHoldersBurns() public {
+        vm.prank(alice);
+        token.transfer(address(this), 1_000e18);
+        vm.prank(bob);
+        token.transfer(address(this), 3_000e18); // the mature holders now carry no weight
+        token.transfer(carol, 5_000_000e18);
+        vm.prank(carol);
+        picker.enroll(); // immature: enrolled in the purchase block
+        (uint256 id, uint256 tokenId) = _acquire();
+        bytes32 seed = commitAndSteer(id, false); // the coin says airdrop
+        assertEq(picker.snapshotInfo(escrow.getAcquisition(id).snapshotId).entryCount, 0);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit FlipResolved(id, tokenId, true, DEAD);
+        vm.expectEmit(true, true, false, true, address(escrow));
+        emit Burned(tokenId, DEAD);
+        escrow.reveal(id, seed);
+        assertEq(nft.ownerOf(tokenId), DEAD);
+        assertTrue(escrow.getAcquisition(id).burned);
+        assertEq(escrow.getAcquisition(id).recipient, DEAD);
+    }
+
+    /// Selling after the commit does not change the outcome; selling before it removes the weight even
+    /// though the recorded weight is untouched.
+    function test_sellingBeforeTheCommitRemovesWeightSellingAfterDoesNot() public {
+        (uint256 first,) = _acquire();
+        vm.prank(bob);
+        token.transfer(carol, 3_000e18); // bob leaves before the commit
+        bytes32 seed = commitAndSteer(first, false);
+        (uint256 w,) = picker.registrationOf(bob);
+        assertEq(w, 3_000e18, "recorded weight is stale but harmless");
+        assertEq(picker.snapshotInfo(escrow.getAcquisition(first).snapshotId).totalWeight, 1_000e18);
+        escrow.reveal(first, seed);
+        assertEq(escrow.getAcquisition(first).recipient, alice);
+
+        vm.prank(carol);
+        token.transfer(bob, 3_000e18);
+        vm.roll(block.number + picker.ENROLL_MATURITY_BLOCKS());
+        (uint256 second,) = _acquire();
+        seed = commitAndSteer(second, false);
+        vm.prank(bob);
+        token.transfer(carol, 3_000e18); // bob leaves after the commit: frozen table still names him
+        assertEq(picker.snapshotInfo(escrow.getAcquisition(second).snapshotId).totalWeight, 4_000e18);
+        escrow.reveal(second, seed);
+        address recipient = escrow.getAcquisition(second).recipient;
+        assertTrue(recipient == alice || recipient == bob);
+    }
+
     function test_requestIdBindsChainEscrowAcquisitionAndToken() public {
         vm.recordLogs();
         (uint256 id, uint256 tokenId) = _acquire();

@@ -314,4 +314,274 @@ contract HolderWeightedPickerEdgeTest is Test {
         assertEq(meta.entryCount, entries);
         assertEq(meta.blockNumber, block.number);
     }
+
+    // ---- recorded weights, maturity, trim and displacement ----
+
+    uint256 internal constant MATURITY = 300;
+
+    function test_tokensReceivedAfterEnrollingAddNoWeightUntilRefreshed() public {
+        _enroll(a, MIN);
+        token.transfer(a, 99 * MIN);
+        uint256 id = picker.snapshot();
+        assertEq(picker.snapshotInfo(id).totalWeight, MIN, "recorded weight caps the live balance");
+        assertEq(picker.weightOf(a, type(uint256).max), MIN);
+        vm.prank(a);
+        picker.refresh();
+        assertEq(picker.weightOf(a, type(uint256).max), 100 * MIN);
+        assertEq(picker.weightOf(a, block.number + MATURITY - 1), 0, "raised weight is immature again");
+        assertEq(picker.weightOf(a, block.number + MATURITY), 100 * MIN);
+    }
+
+    function test_refreshAtAnUnchangedBalanceKeepsTheMaturity() public {
+        _enroll(a, MIN);
+        (, uint256 since) = picker.registrationOf(a);
+        vm.roll(block.number + 50);
+        vm.prank(a);
+        picker.refresh();
+        (uint256 weight, uint256 sinceAfter) = picker.registrationOf(a);
+        assertEq(weight, MIN);
+        assertEq(sinceAfter, since, "equal balance: no maturity restart");
+        vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.NothingToTrim.selector, a, MIN));
+        picker.trim(a);
+    }
+
+    function test_trimDownToZeroLeavesTheSlotButNoWeight() public {
+        _enroll(a, 5 * MIN);
+        _enroll(b, MIN);
+        vm.prank(a);
+        token.transfer(address(this), 5 * MIN);
+        vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.NothingToTrim.selector, b, MIN));
+        picker.trim(b);
+        vm.prank(c); // anyone
+        picker.trim(a);
+        (uint256 weight,) = picker.registrationOf(a);
+        assertEq(weight, 0);
+        assertTrue(picker.isEnrolled(a), "trim is not eviction");
+        assertEq(picker.lowestHolder(), a);
+        uint256 id = picker.snapshot();
+        assertEq(picker.snapshotInfo(id).entryCount, 1);
+        (address winner,) = picker.pick(id, 7);
+        assertEq(winner, b);
+        vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.NothingToTrim.selector, a, 0));
+        picker.trim(a);
+        vm.expectRevert(HolderWeightedPicker.ZeroAddress.selector);
+        picker.trim(address(0));
+        vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.NotEnrolled.selector, c));
+        picker.trim(c);
+    }
+
+    function test_refreshBelowMinimumIsRefusedButTrimStillWorks() public {
+        _enroll(a, 2 * MIN);
+        vm.prank(a);
+        token.transfer(address(this), MIN + 1);
+        vm.prank(a);
+        vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.BelowMinimumBalance.selector, MIN - 1, MIN));
+        picker.refresh();
+        picker.trim(a);
+        (uint256 weight,) = picker.registrationOf(a);
+        assertEq(weight, MIN - 1);
+    }
+
+    /// A full registry: the predicted victim is always the holder `lowestHolder()` names, whose weight is
+    /// the minimum; a newcomer at or below that weight is refused; above it, exactly that holder leaves.
+    /// forge-config: default.fuzz.runs = 60
+    function testFuzz_displacementAtTheCapFollowsTheModel(uint256 seed, uint8 newcomers) public {
+        uint256 cap = picker.MAX_HOLDERS();
+        for (uint256 i = 0; i < cap; ++i) {
+            address h = address(uint160(0xB000 + i));
+            _enroll(h, MIN + bound(uint256(keccak256(abi.encode(seed, "w", i))), 0, 5));
+        }
+        newcomers = uint8(bound(newcomers, 1, 16));
+        for (uint256 n = 0; n < newcomers; ++n) {
+            address victim = picker.lowestHolder();
+            (uint256 victimWeight,) = picker.registrationOf(victim);
+            assertEq(victimWeight, _minRecordedWeight(), "lowestHolder is not a minimum");
+            address newcomer = address(uint160(0xC000 + n));
+            uint256 balance = MIN + bound(uint256(keccak256(abi.encode(seed, "n", n))), 0, 7);
+            token.transfer(newcomer, balance);
+            vm.prank(newcomer);
+            if (balance <= victimWeight) {
+                vm.expectRevert(HolderWeightedPicker.RegistryFull.selector);
+                picker.enroll();
+                assertTrue(picker.isEnrolled(victim));
+                continue;
+            }
+            picker.enroll();
+            assertFalse(picker.isEnrolled(victim), "the predicted victim stayed");
+            assertTrue(picker.isEnrolled(newcomer));
+            assertEq(picker.holderCount(), cap);
+            (uint256 w, uint256 since) = picker.registrationOf(newcomer);
+            assertEq(w, balance);
+            assertEq(since, block.number);
+            // the displaced holder can come straight back by beating the new minimum
+            uint256 minNow = _minRecordedWeight();
+            uint256 victimBalance = token.balanceOf(victim);
+            if (victimBalance <= minNow) token.transfer(victim, minNow + 1 - victimBalance);
+            vm.prank(victim);
+            picker.enroll();
+            assertTrue(picker.isEnrolled(victim));
+            assertEq(picker.holderCount(), cap);
+        }
+        _assertRegistryConsistent();
+    }
+
+    /// Random enrol / transfer / refresh / trim / evict / roll sequences: recorded weights, the lowest
+    /// entry and both snapshot flavours agree with an independent model (kept in storage).
+    /// forge-config: default.fuzz.runs = 120
+    function testFuzz_registryBookkeepingMatchesAModel(uint256 seed, uint8 steps) public {
+        _modelHolders = [a, b, c, makeAddr("d"), makeAddr("e"), makeAddr("f")];
+        steps = uint8(bound(steps, 1, 40));
+        for (uint256 s = 0; s < steps; ++s) {
+            _modelStep(uint256(keccak256(abi.encode(seed, s))));
+            _modelCheck();
+        }
+        _assertRegistryConsistent();
+    }
+
+    address[6] internal _modelHolders;
+    uint256[6] internal _modelRecorded;
+    uint256[6] internal _modelSince;
+    bool[6] internal _modelEnrolled;
+
+    function _modelStep(uint256 r) internal {
+        uint256 i = r % 6;
+        address h = _modelHolders[i];
+        uint256 op = (r >> 8) % 7;
+        uint256 amount = bound(r >> 16, 0, 4 * MIN);
+        if (op == 0) {
+            token.transfer(h, amount);
+            _modelEnroll(i, h);
+        } else if (op == 1) {
+            uint256 bal = token.balanceOf(h);
+            vm.prank(h);
+            token.transfer(address(this), amount > bal ? bal : amount);
+        } else if (op == 2) {
+            token.transfer(h, amount);
+        } else if (op == 3) {
+            _modelRefresh(i, h);
+        } else if (op == 4) {
+            _modelTrim(i, h);
+        } else if (op == 5) {
+            _modelEvict(i, h);
+        } else {
+            vm.roll(block.number + bound(r >> 32, 1, 200));
+        }
+    }
+
+    function _modelEnroll(uint256 i, address h) internal {
+        uint256 bal = token.balanceOf(h);
+        vm.prank(h);
+        if (_modelEnrolled[i]) {
+            vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.AlreadyEnrolled.selector, h));
+            picker.enroll();
+        } else if (bal < MIN) {
+            vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.BelowMinimumBalance.selector, bal, MIN));
+            picker.enroll();
+        } else {
+            picker.enroll();
+            _modelEnrolled[i] = true;
+            _modelRecorded[i] = bal;
+            _modelSince[i] = block.number;
+        }
+    }
+
+    function _modelRefresh(uint256 i, address h) internal {
+        uint256 bal = token.balanceOf(h);
+        vm.prank(h);
+        if (!_modelEnrolled[i]) {
+            vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.NotEnrolled.selector, h));
+            picker.refresh();
+        } else if (bal < MIN) {
+            vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.BelowMinimumBalance.selector, bal, MIN));
+            picker.refresh();
+        } else {
+            picker.refresh();
+            if (bal > _modelRecorded[i]) _modelSince[i] = block.number;
+            _modelRecorded[i] = bal;
+        }
+    }
+
+    function _modelTrim(uint256 i, address h) internal {
+        uint256 bal = token.balanceOf(h);
+        if (!_modelEnrolled[i]) {
+            vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.NotEnrolled.selector, h));
+            picker.trim(h);
+        } else if (bal >= _modelRecorded[i]) {
+            vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.NothingToTrim.selector, h, bal));
+            picker.trim(h);
+        } else {
+            picker.trim(h);
+            _modelRecorded[i] = bal;
+        }
+    }
+
+    function _modelEvict(uint256 i, address h) internal {
+        uint256 bal = token.balanceOf(h);
+        if (!_modelEnrolled[i]) {
+            vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.NotEnrolled.selector, h));
+            picker.evict(h);
+        } else if (bal >= MIN) {
+            vm.expectRevert(abi.encodeWithSelector(HolderWeightedPicker.StillEligible.selector, h, bal));
+            picker.evict(h);
+        } else {
+            picker.evict(h);
+            _modelEnrolled[i] = false;
+            _modelRecorded[i] = 0;
+            _modelSince[i] = 0;
+        }
+    }
+
+    function _modelCheck() internal {
+        uint256 count = 0;
+        uint256 minWeight = type(uint256).max;
+        uint256 liveSum = 0;
+        uint256 matureSum = 0;
+        for (uint256 k = 0; k < 6; ++k) {
+            address h = _modelHolders[k];
+            assertEq(picker.isEnrolled(h), _modelEnrolled[k], "enrolment flag");
+            if (!_modelEnrolled[k]) continue;
+            count += 1;
+            (uint256 w, uint256 sb) = picker.registrationOf(h);
+            assertEq(w, _modelRecorded[k], "recorded weight");
+            assertEq(sb, _modelSince[k], "maturity block");
+            if (w < minWeight) minWeight = w;
+            uint256 live = token.balanceOf(h);
+            uint256 eff = live < w ? live : w;
+            bool mature = _modelSince[k] + MATURITY <= block.number;
+            liveSum += eff;
+            if (mature) matureSum += eff;
+            assertEq(picker.weightOf(h, type(uint256).max), eff, "live weight");
+            assertEq(picker.weightOf(h, block.number), mature ? eff : 0, "mature weight");
+        }
+        assertEq(picker.holderCount(), count);
+        address lowest = picker.lowestHolder();
+        if (count == 0) {
+            assertEq(lowest, address(0));
+        } else {
+            assertTrue(picker.isEnrolled(lowest), "lowest is not enrolled");
+            (uint256 lw,) = picker.registrationOf(lowest);
+            assertEq(lw, minWeight, "lowest is not the minimum recorded weight");
+        }
+        assertEq(picker.snapshotInfo(picker.snapshot()).totalWeight, liveSum, "live snapshot total");
+        assertEq(picker.snapshotInfo(picker.snapshotFor(block.number)).totalWeight, matureSum, "mature total");
+    }
+
+    function _minRecordedWeight() internal view returns (uint256 minWeight) {
+        minWeight = type(uint256).max;
+        for (uint256 i = 0; i < picker.holderCount(); ++i) {
+            (uint256 w,) = picker.registrationOf(picker.holderAt(i));
+            if (w < minWeight) minWeight = w;
+        }
+    }
+
+    function _assertRegistryConsistent() internal view {
+        uint256 n = picker.holderCount();
+        for (uint256 i = 0; i < n; ++i) {
+            address h = picker.holderAt(i);
+            assertTrue(picker.isEnrolled(h));
+            for (uint256 j = i + 1; j < n; ++j) {
+                assertTrue(picker.holderAt(j) != h, "duplicate registry entry");
+            }
+        }
+    }
 }

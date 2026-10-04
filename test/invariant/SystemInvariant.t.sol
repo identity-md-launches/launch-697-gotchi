@@ -105,6 +105,16 @@ contract SystemInvariantTest is GotchiFixture {
         assertEq(feeSink.buyCount(), escrow.acquisitionCount(), "every purchase became exactly one acquisition");
     }
 
+    /// Every purchase paid a price inside [MIN_BUY_PRICE, MAX_BUY_PRICE], so lifetime spend is bounded
+    /// by the purchase count on both sides (per-purchase bounds are asserted in the handler).
+    /// forge-config: default.invariant.runs = 64
+    /// forge-config: default.invariant.depth = 150
+    function invariant_sinkSpendStaysInsideThePriceBand() public view {
+        uint256 buys = feeSink.buyCount();
+        assertGe(feeSink.totalSpent(), buys * 0.001 ether, "a purchase below the floor");
+        assertLe(feeSink.totalSpent(), buys * 0.05 ether, "a purchase above the ceiling");
+    }
+
     // ---------------------------------------------------------------- market
 
     /// The market's ETH is exactly the sellers' unwithdrawn credit, and everything ever paid in is either
@@ -139,7 +149,7 @@ contract SystemInvariantTest is GotchiFixture {
             IMockBaazaar.Listing memory l = market.getListing(id);
             assertTrue(l.active, "active set holds only active listings");
             assertEq(l.listingId, id);
-            assertGt(l.price, 0, "no free listings");
+            assertGe(l.price, 0.001 ether, "listing below the floor");
             assertLt(id, market.nextListingId());
             assertEq(nft.ownerOf(l.tokenId), address(market), "listed NFT is in custody");
             assertTrue(
@@ -248,10 +258,22 @@ contract SystemInvariantTest is GotchiFixture {
             }
         }
         uint256 enrolledActors = 0;
+        uint256 minWeight = type(uint256).max;
         for (uint256 i = 0; i < actors.length; ++i) {
-            if (picker.isEnrolled(actors[i])) enrolledActors += 1;
+            if (!picker.isEnrolled(actors[i])) continue;
+            enrolledActors += 1;
+            (uint256 w,) = picker.registrationOf(actors[i]);
+            if (w < minWeight) minWeight = w;
         }
         assertEq(enrolledActors, holders, "enrolled flag without a registry slot");
+        address lowest = picker.lowestHolder();
+        if (holders == 0) {
+            assertEq(lowest, address(0), "lowest holder on an empty registry");
+        } else {
+            assertTrue(picker.isEnrolled(lowest), "lowest holder is not enrolled");
+            (uint256 lw,) = picker.registrationOf(lowest);
+            assertEq(lw, minWeight, "lowest holder does not carry the minimum recorded weight");
+        }
 
         uint256 snapshots = picker.snapshotCount();
         uint256 from = snapshots > 4 ? snapshots - 3 : 1; // the most recent tables
@@ -304,6 +326,18 @@ contract SystemInvariantTest is GotchiFixture {
         handler.cancelByNonSeller(3, 0);
         handler.withdraw(0);
         handler.withdraw(4); // nothing credited: revert asserted inside
+        handler.listBelowFloor(0, 5);
+        handler.listAboveCeiling(1, 0.2 ether);
+        handler.partialTokenExactIn(0, 1e22, 1_000_000e18);
+        handler.partialEthExactIn(1, 1e22, 0.01 ether);
+        assertGt(handler.ghostPartialFills() + handler.ghostRefusedPartials(), 0, "partial fill paths");
+        handler.refresh(0); // enrolled, balance changed by the swaps above
+        handler.refresh(4); // never enrolled: revert asserted inside
+        handler.trim(3, 1); // actor 1 sold tokens above: stale weight trimmed
+        handler.trim(3, 4); // not enrolled: revert asserted inside
+
+        // the registry must mature before airdrops can happen: purchases from here on count the holders
+        vm.roll(block.number + 301);
 
         // resolve acquisitions until both branches have been seen
         uint256 guard = 0;
@@ -338,7 +372,17 @@ contract SystemInvariantTest is GotchiFixture {
         handler.seedMore(0, 0.1 ether);
         handler.buyDirect(1, 5);
         handler.cancel(0);
+        handler.rollPastMaturity(8);
 
+        // fill the market, then evict through a cheaper listing and be refused with an equal one
+        while (market.activeCount() < 64) {
+            handler.list(guard, 0.02 ether);
+        }
+        handler.listNearFloor(1, 0); // strictly cheaper: evicts the dearest
+        handler.list(2, 0.02 ether); // not cheaper: refused (asserted inside)
+        assertGt(handler.ghostEvictions(), 0, "eviction path reached");
+
+        invariant_sinkSpendStaysInsideThePriceBand();
         invariant_sinkBalanceIsReceivedMinusSpent();
         invariant_marketEthEqualsSellerCredits();
         invariant_marketListingsAreBackedAndCheapestIsMinimal();

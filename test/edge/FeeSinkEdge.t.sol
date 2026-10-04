@@ -13,11 +13,13 @@ import {IMockBaazaar} from "../../src/interfaces/IMockBaazaar.sol";
 /// @notice Threshold boundaries, hostile siblings and role handover for FeeSink.
 contract FeeSinkEdgeTest is GotchiFixture {
     uint256 internal constant THRESHOLD = 0.01 ether;
+    uint256 internal constant FLOOR = 0.001 ether; // MIN_LIST_PRICE == MIN_BUY_PRICE
+    uint256 internal constant CEILING = 0.05 ether; // MAX_BUY_PRICE
 
     // ---- threshold boundaries ----
 
-    function test_oneWeiBelowThresholdNeverBuysEvenAOneWeiListing() public {
-        (uint256 id,) = listNft(seller, 1);
+    function test_oneWeiBelowThresholdNeverBuysEvenTheCheapestAllowedListing() public {
+        (uint256 id,) = listNft(seller, FLOOR);
         fundSink(THRESHOLD - 1);
         assertFalse(feeSink.tryBuy());
         assertTrue(market.getListing(id).active);
@@ -77,15 +79,80 @@ contract FeeSinkEdgeTest is GotchiFixture {
         assertEq(feeSink.totalSpent(), 0.002 ether);
     }
 
-    /// The sink buys exactly when it holds at least 0.01 ETH and the cheapest listing costs no more than
-    /// its balance, and then pays exactly the price.
+    // ---- price band boundaries ----
+
+    function test_oneWeiAboveTheCeilingIsNeverBoughtWhateverTheBalance() public {
+        (uint256 id,) = listNft(seller, CEILING + 1);
+        fundSink(1 ether);
+        (bool possible,) = feeSink.pendingBuy();
+        assertFalse(possible);
+        assertFalse(feeSink.tryBuy());
+        assertTrue(market.getListing(id).active);
+        assertEq(address(feeSink).balance, 1 ether, "fees keep accumulating behind an over-ceiling listing");
+        // a listing at the ceiling itself is bought, and the one above it is left behind
+        (, uint256 tokenId) = listNft(alice, CEILING);
+        assertTrue(feeSink.tryBuy());
+        assertEq(nft.ownerOf(tokenId), address(escrow));
+        assertEq(feeSink.totalSpent(), CEILING);
+        assertTrue(market.getListing(id).active);
+        assertFalse(feeSink.tryBuy(), "the over-ceiling listing is still skipped");
+    }
+
+    function test_ceilingBindsEvenWhenTheBalanceIsFarLarger() public {
+        listNft(seller, 0.5 ether);
+        fundSink(10 ether);
+        assertFalse(feeSink.tryBuy());
+        assertEq(address(feeSink).balance, 10 ether);
+        assertEq(feeSink.buyCount(), 0);
+    }
+
+    function test_cheapestAtTheFloorIsBoughtAndOneBelowCannotEvenBeListed() public {
+        (, uint256 tokenId) = listNft(seller, FLOOR);
+        uint256 extra = nft.mint(seller);
+        vm.startPrank(seller);
+        nft.approve(address(market), extra);
+        vm.expectRevert(MockBaazaar.InvalidPrice.selector);
+        market.list(extra, FLOOR - 1);
+        vm.stopPrank();
+        fundSink(THRESHOLD);
+        assertTrue(feeSink.tryBuy());
+        assertEq(nft.ownerOf(tokenId), address(escrow));
+        assertEq(feeSink.totalSpent(), FLOOR);
+        assertEq(feeSink.MIN_BUY_PRICE(), market.MIN_LIST_PRICE(), "sink floor and market floor agree");
+    }
+
+    /// The threshold is re-checked on every trigger: one 0.01 ETH funds one floor purchase and leaves
+    /// 0.009 ETH idle; each further 0.001 ETH of fees funds exactly one more.
+    function test_thresholdIsRecheckedOnEveryTriggerSoFloorListingsDrainOneAtATime() public {
+        for (uint256 i = 0; i < 12; ++i) {
+            listNft(seller, FLOOR);
+        }
+        fundSink(THRESHOLD);
+        assertTrue(feeSink.tryBuy());
+        assertFalse(feeSink.tryBuy(), "0.009 ETH left: below the threshold");
+        assertEq(address(feeSink).balance, THRESHOLD - FLOOR);
+        for (uint256 i = 0; i < 9; ++i) {
+            fundSink(FLOOR - 1);
+            assertFalse(feeSink.tryBuy(), "one wei short of the threshold");
+            fundSink(1);
+            assertTrue(feeSink.tryBuy());
+        }
+        assertEq(feeSink.buyCount(), 10);
+        assertEq(feeSink.totalSpent(), 10 * FLOOR);
+        assertEq(address(feeSink).balance, THRESHOLD - FLOOR, "the sink always keeps threshold minus one price");
+        assertEq(market.activeCount(), 2);
+        assertEq(escrow.acquisitionCount(), 10);
+    }
+
+    /// The sink buys exactly when it holds at least 0.01 ETH and the cheapest listing is inside the
+    /// [0.001, 0.05] ETH band and costs no more than its balance; it then pays exactly the price.
     /// forge-config: default.fuzz.runs = 500
     function testFuzz_buysIffThresholdMetAndAffordable(uint256 funded, uint256 price) public {
-        funded = bound(funded, 0, 0.03 ether);
-        price = bound(price, 1, 0.04 ether);
+        funded = bound(funded, 0, 0.07 ether);
+        price = bound(price, FLOOR, 0.06 ether);
         (uint256 id, uint256 tokenId) = listNft(seller, price);
         fundSink(funded);
-        bool expected = funded >= THRESHOLD && price <= funded;
+        bool expected = funded >= THRESHOLD && price <= funded && price <= CEILING;
         (bool possible,) = feeSink.pendingBuy();
         assertEq(possible, expected, "pendingBuy disagrees with the rule");
         assertEq(feeSink.tryBuy(), expected, "tryBuy disagrees with the rule");
