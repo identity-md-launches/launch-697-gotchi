@@ -1,0 +1,518 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.26;
+
+import {Test} from "forge-std/Test.sol";
+import {PoolManager} from "v4-core/PoolManager.sol";
+import {PoolKey} from "v4-core/types/PoolKey.sol";
+import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
+import {SwapParams} from "v4-core/types/PoolOperation.sol";
+import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {LaunchToken} from "../../src/LaunchToken.sol";
+import {MockGotchiNFT} from "../../src/MockGotchiNFT.sol";
+import {MockBaazaar} from "../../src/MockBaazaar.sol";
+import {HolderWeightedPicker} from "../../src/HolderWeightedPicker.sol";
+import {FlipEscrow} from "../../src/FlipEscrow.sol";
+import {FeeSink} from "../../src/FeeSink.sol";
+import {GotchiFeeHook} from "../../src/GotchiFeeHook.sol";
+import {ForeverLiquidity} from "../../src/ForeverLiquidity.sol";
+import {IMockBaazaar} from "../../src/interfaces/IMockBaazaar.sol";
+import {SwapRouterHarness} from "../utils/SwapRouterHarness.sol";
+
+/// @notice Drives the whole $GOTCHI system with several actors and bounded inputs. Every action checks
+/// its own post-conditions (assertion mode); the invariant contract checks the global properties.
+/// @dev Expected outcomes are computed here from first principles (30 bps, 0.01 ETH threshold, top bit of
+/// the random word, block windows) rather than by calling the contracts' own helpers.
+contract SystemHandler is Test {
+    struct Refs {
+        PoolManager manager;
+        LaunchToken token;
+        MockGotchiNFT nft;
+        MockBaazaar market;
+        HolderWeightedPicker picker;
+        FlipEscrow escrow;
+        FeeSink feeSink;
+        GotchiFeeHook hook;
+        ForeverLiquidity forever;
+        SwapRouterHarness router;
+        address owner;
+    }
+
+    address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    uint256 internal constant THRESHOLD = 0.01 ether;
+    uint256 internal constant MIN_ENROLL = 1_000e18;
+    uint256 internal constant MAX_HOLDERS = 128;
+    uint256 internal constant MAX_LISTINGS = 64;
+
+    Refs internal r;
+    PoolKey internal key;
+    address[] internal _actors;
+
+    // ---- ghosts ----
+    uint256 public ghostDonated; // ETH sent straight to the sink
+    uint256 public ghostFees; // ETH the hook skimmed, summed from each swap's independently computed fee
+    uint256 public ghostDirectPaid; // ETH actors paid the market directly
+    uint256 public ghostWithdrawn; // ETH sellers withdrew
+    uint256 public ghostBurns;
+    uint256 public ghostAirdrops;
+    uint256 public ghostTimeouts;
+    uint256 public ghostSwaps;
+    uint256 public ghostLiquidityFloor; // forever liquidity never drops below this
+    mapping(uint256 acquisitionId => bytes32 seed) public seedOf;
+    mapping(uint256 acquisitionId => bool resolved) public ghostResolved;
+    mapping(uint256 acquisitionId => address recipient) public ghostRecipient;
+    uint256[] internal _airdroppedTokens;
+
+    constructor(Refs memory refs, address[] memory actors_) {
+        r = refs;
+        key = refs.forever.poolKey();
+        _actors = actors_;
+        ghostLiquidityFloor = refs.forever.totalLiquidity();
+        for (uint256 i = 0; i < actors_.length; ++i) {
+            vm.startPrank(actors_[i]);
+            refs.token.approve(address(refs.router), type(uint256).max);
+            refs.token.approve(address(refs.forever), type(uint256).max);
+            refs.nft.setApprovalForAll(address(refs.market), true);
+            vm.stopPrank();
+        }
+    }
+
+    function actors() external view returns (address[] memory) {
+        return _actors;
+    }
+
+    function _actor(uint256 seed) internal view returns (address) {
+        return _actors[seed % _actors.length];
+    }
+
+    /// @dev One input in four stays in the dust range (edge cases: zero fee, one wei); the rest are sized
+    /// so that fees actually reach the purchase threshold within a run.
+    function _sized(uint256 x, uint256 dustMax, uint256 low, uint256 high) internal pure returns (uint256) {
+        return x % 4 == 0 ? bound(x, 1, dustMax) : bound(x, low, high);
+    }
+
+    function _bps30(uint256 amount) internal pure returns (uint256) {
+        return (amount * 30) / 10_000;
+    }
+
+    // ---------------------------------------------------------------- swaps
+
+    /// ETH exact-in: the fee is 30 bps of the ETH the swapper sends, and they pay exactly `ethIn`.
+    function buyExactEthIn(uint256 actorSeed, uint256 ethIn) external {
+        address a = _actor(actorSeed);
+        ethIn = _sized(ethIn, 1000, 0.05 ether, 2 ether);
+        if (a.balance < ethIn) return;
+        uint256 feesBefore = r.hook.totalFeesCollected();
+        uint256 receivedBefore = r.feeSink.totalReceived();
+        uint256 ethBefore = a.balance;
+        vm.prank(a);
+        r.router.swap{value: ethIn}(key, SwapParams(true, -int256(ethIn), TickMath.MIN_SQRT_PRICE + 1));
+        uint256 fee = r.hook.totalFeesCollected() - feesBefore;
+        assertEq(fee, _bps30(ethIn), "exact ETH in: fee is 30 bps of the input");
+        assertEq(r.feeSink.totalReceived() - receivedBefore, fee, "exact ETH in: sink received the fee");
+        assertEq(ethBefore - a.balance, ethIn, "exact ETH in: swapper paid exactly the input");
+        ghostFees += fee;
+        ghostSwaps += 1;
+    }
+
+    /// Token exact-out bought with ETH: the fee is charged on top of the ETH the pool takes.
+    function buyExactTokensOut(uint256 actorSeed, uint256 tokensOut) external {
+        address a = _actor(actorSeed);
+        uint256 poolTokens = r.token.balanceOf(address(r.manager));
+        tokensOut = _sized(tokensOut, 1000, poolTokens / 1000, poolTokens / 8);
+        uint256 feesBefore = r.hook.totalFeesCollected();
+        uint256 receivedBefore = r.feeSink.totalReceived();
+        uint256 ethBefore = a.balance;
+        uint256 tokensBefore = r.token.balanceOf(a);
+        vm.prank(a);
+        try r.router.swap{value: ethBefore}(key, SwapParams(true, int256(tokensOut), TickMath.MIN_SQRT_PRICE + 1)) {}
+        catch {
+            return; // not enough ETH for this size
+        }
+        uint256 fee = r.hook.totalFeesCollected() - feesBefore;
+        uint256 paid = ethBefore - a.balance;
+        assertEq(r.token.balanceOf(a) - tokensBefore, tokensOut, "exact tokens out: delivered exactly");
+        assertEq(fee, _bps30(paid - fee), "exact tokens out: fee is 30 bps of the pool's ETH leg");
+        assertEq(r.feeSink.totalReceived() - receivedBefore, fee, "exact tokens out: sink received the fee");
+        ghostFees += fee;
+        ghostSwaps += 1;
+    }
+
+    /// Token exact-in sold for ETH: the fee comes out of the ETH the pool pays.
+    function sellExactTokensIn(uint256 actorSeed, uint256 tokensIn) external {
+        address a = _actor(actorSeed);
+        uint256 balance = r.token.balanceOf(a);
+        if (balance < 1) return;
+        tokensIn = _sized(tokensIn, balance < 1000 ? balance : 1000, (balance + 9) / 10, balance);
+        uint256 feesBefore = r.hook.totalFeesCollected();
+        uint256 receivedBefore = r.feeSink.totalReceived();
+        uint256 ethBefore = a.balance;
+        vm.prank(a);
+        r.router.swap(key, SwapParams(false, -int256(tokensIn), TickMath.MAX_SQRT_PRICE - 1));
+        uint256 fee = r.hook.totalFeesCollected() - feesBefore;
+        uint256 got = a.balance - ethBefore;
+        assertEq(balance - r.token.balanceOf(a), tokensIn, "exact tokens in: paid exactly");
+        assertEq(fee, _bps30(got + fee), "exact tokens in: fee is 30 bps of the pool's ETH leg");
+        assertEq(r.feeSink.totalReceived() - receivedBefore, fee, "exact tokens in: sink received the fee");
+        ghostFees += fee;
+        ghostSwaps += 1;
+    }
+
+    /// ETH exact-out sold from tokens: the swapper receives exactly `ethOut`, the fee is 30 bps of it.
+    function sellForExactEthOut(uint256 actorSeed, uint256 ethOut) external {
+        address a = _actor(actorSeed);
+        ethOut = _sized(ethOut, 1000, address(r.manager).balance / 1000, address(r.manager).balance / 8);
+        uint256 feesBefore = r.hook.totalFeesCollected();
+        uint256 receivedBefore = r.feeSink.totalReceived();
+        uint256 ethBefore = a.balance;
+        vm.prank(a);
+        try r.router.swap(key, SwapParams(false, int256(ethOut), TickMath.MAX_SQRT_PRICE - 1)) {}
+        catch {
+            return; // not enough tokens for this size
+        }
+        uint256 fee = r.hook.totalFeesCollected() - feesBefore;
+        assertEq(a.balance - ethBefore, ethOut, "exact ETH out: delivered exactly");
+        assertEq(fee, _bps30(ethOut), "exact ETH out: fee is 30 bps of the output");
+        assertEq(r.feeSink.totalReceived() - receivedBefore, fee, "exact ETH out: sink received the fee");
+        ghostFees += fee;
+        ghostSwaps += 1;
+    }
+
+    // ---------------------------------------------------------------- sink
+
+    function donateToSink(uint256 actorSeed, uint256 amount) external {
+        address a = _actor(actorSeed);
+        amount = amount % 4 == 0 ? bound(amount, 0, 1000) : bound(amount, 0.002 ether, 0.03 ether);
+        if (a.balance < amount) return;
+        vm.prank(a);
+        (bool ok,) = address(r.feeSink).call{value: amount}("");
+        assertTrue(ok, "sink accepts ETH");
+        ghostDonated += amount;
+    }
+
+    /// The owner's manual trigger buys exactly when balance >= 0.01 ETH and the cheapest listing is affordable.
+    function keeperTryBuy() external {
+        uint256 balance = address(r.feeSink).balance;
+        IMockBaazaar.Listing memory c = r.market.cheapest();
+        bool expected = balance >= THRESHOLD && c.active && c.price <= balance;
+        uint256 buysBefore = r.feeSink.buyCount();
+        uint256 creditBefore = r.market.proceeds(c.seller);
+        vm.prank(r.owner);
+        bool bought = r.feeSink.tryBuy();
+        assertEq(bought, expected, "tryBuy buys iff threshold met and cheapest affordable");
+        if (bought) {
+            assertEq(address(r.feeSink).balance, balance - c.price, "sink paid exactly the listing price");
+            assertEq(r.market.proceeds(c.seller) - creditBefore, c.price, "seller credited the price");
+            assertEq(r.nft.ownerOf(c.tokenId), address(r.escrow), "NFT went to the escrow");
+            assertEq(r.feeSink.buyCount(), buysBefore + 1);
+            assertEq(r.escrow.openAcquisitionOf(c.tokenId), r.escrow.acquisitionCount(), "flip requested");
+        } else {
+            assertEq(address(r.feeSink).balance, balance, "no-buy leaves the balance untouched");
+            assertEq(r.feeSink.buyCount(), buysBefore);
+        }
+    }
+
+    function strangerTryBuy(uint256 actorSeed) external {
+        vm.prank(_actor(actorSeed));
+        vm.expectRevert(FeeSink.NotTrigger.selector);
+        r.feeSink.tryBuy();
+    }
+
+    // ---------------------------------------------------------------- market
+
+    function list(uint256 actorSeed, uint256 price) external {
+        address a = _actor(actorSeed);
+        price = bound(price, 1, 0.03 ether);
+        uint256 tokenId = r.nft.mint(a);
+        _list(a, tokenId, price);
+    }
+
+    /// An airdrop winner lists the NFT they received, so the same token id can be bought again.
+    function relistAirdropped(uint256 index, uint256 price) external {
+        if (_airdroppedTokens.length < 1) return;
+        uint256 tokenId = _airdroppedTokens[index % _airdroppedTokens.length];
+        address owner = r.nft.ownerOf(tokenId);
+        if (owner == address(r.market) || owner == address(r.escrow) || owner == DEAD) return;
+        _list(owner, tokenId, bound(price, 1, 0.03 ether));
+    }
+
+    function _list(address a, uint256 tokenId, uint256 price) internal {
+        uint256 active = r.market.activeCount();
+        uint256 expectedId = r.market.nextListingId();
+        vm.prank(a);
+        if (active >= MAX_LISTINGS) {
+            vm.expectRevert(MockBaazaar.MarketFull.selector);
+            r.market.list(tokenId, price);
+            return;
+        }
+        uint256 id = r.market.list(tokenId, price);
+        assertEq(id, expectedId, "listing ids are sequential");
+        assertEq(r.nft.ownerOf(tokenId), address(r.market), "listed NFT is escrowed by the market");
+        assertEq(r.market.activeCount(), active + 1);
+    }
+
+    function cancel(uint256 index) external {
+        uint256 active = r.market.activeCount();
+        if (active < 1) return;
+        uint256 id = r.market.activeIdAt(index % active);
+        IMockBaazaar.Listing memory l = r.market.getListing(id);
+        vm.prank(l.seller);
+        r.market.cancel(id);
+        assertEq(r.nft.ownerOf(l.tokenId), l.seller, "cancel returns the NFT");
+        assertFalse(r.market.getListing(id).active);
+        assertEq(r.market.activeCount(), active - 1);
+    }
+
+    function cancelByNonSeller(uint256 actorSeed, uint256 index) external {
+        uint256 active = r.market.activeCount();
+        if (active < 1) return;
+        uint256 id = r.market.activeIdAt(index % active);
+        address a = _actor(actorSeed);
+        if (a == r.market.getListing(id).seller) return;
+        vm.prank(a);
+        vm.expectRevert(MockBaazaar.NotSeller.selector);
+        r.market.cancel(id);
+    }
+
+    function buyDirect(uint256 actorSeed, uint256 overpay) external {
+        address a = _actor(actorSeed);
+        IMockBaazaar.Listing memory c = r.market.cheapest();
+        if (!c.active) return;
+        uint256 pay = c.price + bound(overpay, 0, 0.001 ether);
+        if (a.balance < pay) return;
+        uint256 creditBefore = r.market.proceeds(c.seller);
+        vm.prank(a);
+        uint256 tokenId = r.market.buyCheapest{value: pay}(c.listingId, a);
+        assertEq(tokenId, c.tokenId);
+        assertEq(r.nft.ownerOf(tokenId), a, "buyer received the NFT");
+        assertEq(r.market.proceeds(c.seller) - creditBefore, pay, "seller credited everything sent");
+        ghostDirectPaid += pay;
+    }
+
+    function underpay(uint256 actorSeed) external {
+        address a = _actor(actorSeed);
+        IMockBaazaar.Listing memory c = r.market.cheapest();
+        if (!c.active || a.balance < c.price) return;
+        vm.prank(a);
+        vm.expectRevert(abi.encodeWithSelector(MockBaazaar.InsufficientPayment.selector, c.price, c.price - 1));
+        r.market.buyCheapest{value: c.price - 1}(c.listingId, a);
+    }
+
+    function withdraw(uint256 actorSeed) external {
+        address a = _actor(actorSeed);
+        uint256 credit = r.market.proceeds(a);
+        uint256 before = a.balance;
+        vm.prank(a);
+        if (credit < 1) {
+            vm.expectRevert(MockBaazaar.NothingToWithdraw.selector);
+            r.market.withdrawProceeds();
+            return;
+        }
+        r.market.withdrawProceeds();
+        assertEq(a.balance, before + credit, "seller withdrew exactly their credit");
+        assertEq(r.market.proceeds(a), 0);
+        ghostWithdrawn += credit;
+    }
+
+    // ---------------------------------------------------------------- flips
+
+    function _acquisition(uint256 idSeed) internal view returns (uint256 id, FlipEscrow.Acquisition memory a) {
+        uint256 count = r.escrow.acquisitionCount();
+        if (count < 1) return (0, a);
+        id = bound(idSeed, 1, count);
+        a = r.escrow.getAcquisition(id);
+    }
+
+    /// @dev The acquisition in `wanted` status nearest to the fuzzed id (searching upward, wrapping), so
+    /// commits and reveals land on live flips instead of mostly missing them. Falls back to the fuzzed id.
+    function _acquisitionIn(uint256 idSeed, FlipEscrow.Status wanted)
+        internal
+        view
+        returns (uint256 id, FlipEscrow.Acquisition memory a)
+    {
+        uint256 count = r.escrow.acquisitionCount();
+        if (count < 1) return (0, a);
+        uint256 start = bound(idSeed, 1, count);
+        uint256 span = count < 48 ? count : 48;
+        for (uint256 i = 0; i < span; ++i) {
+            id = ((start - 1 + i) % count) + 1;
+            a = r.escrow.getAcquisition(id);
+            if (a.status == wanted) return (id, a);
+        }
+        id = start;
+        a = r.escrow.getAcquisition(id);
+    }
+
+    function commit(uint256 idSeed, bytes32 salt) external {
+        (uint256 id, FlipEscrow.Acquisition memory a) = _acquisitionIn(idSeed, FlipEscrow.Status.Pending);
+        if (id < 1 || a.status != FlipEscrow.Status.Pending) return;
+        bytes32 seed = keccak256(abi.encode(salt, id));
+        uint256 snapshotsBefore = r.picker.snapshotCount();
+        vm.prank(r.owner);
+        r.escrow.commit(id, keccak256(abi.encode(seed)));
+        seedOf[id] = seed;
+        a = r.escrow.getAcquisition(id);
+        assertEq(a.snapshotId, snapshotsBefore + 1, "commit freezes a fresh snapshot");
+        assertEq(a.commitBlock, vm.getBlockNumber());
+    }
+
+    function commitByNonFlipper(uint256 actorSeed, uint256 idSeed) external {
+        (uint256 id,) = _acquisition(idSeed);
+        vm.prank(_actor(actorSeed));
+        vm.expectRevert(FlipEscrow.NotFlipper.selector);
+        r.escrow.commit(id, bytes32(uint256(1)));
+    }
+
+    function reveal(uint256 actorSeed, uint256 idSeed, bytes32 entropy) external {
+        (uint256 id, FlipEscrow.Acquisition memory a) = _acquisitionIn(idSeed, FlipEscrow.Status.Committed);
+        if (id < 1 || a.status != FlipEscrow.Status.Committed) return;
+        uint256 from = uint256(a.commitBlock) + 2;
+        uint256 current = vm.getBlockNumber();
+        if (current > from + 200) return; // window missed: only timeoutBurn can resolve it
+        if (current < from) {
+            vm.roll(from);
+        }
+        uint256 entropyBlock = uint256(a.commitBlock) + 1;
+        if (blockhash(entropyBlock) == bytes32(0)) {
+            vm.setBlockhash(entropyBlock, entropy == bytes32(0) ? bytes32(uint256(1)) : entropy);
+        }
+        bytes32 seed = seedOf[id];
+        uint256 word = uint256(keccak256(abi.encode(seed, blockhash(entropyBlock), id, a.tokenId)));
+        bool expectBurn = word >> 255 == 0; // FLIP_BURN_BPS = 5000: the lower half burns
+        address expectRecipient = DEAD;
+        if (!expectBurn) {
+            (address picked, uint256 weight) = r.picker.pick(a.snapshotId, word);
+            if (picked == address(0)) {
+                expectBurn = true;
+            } else {
+                expectRecipient = picked;
+                assertGt(weight, 0, "a recipient always carries weight");
+                assertTrue(picked != DEAD, "burn address never wins");
+                assertTrue(r.picker.snapshotInfo(a.snapshotId).totalWeight >= weight);
+            }
+        }
+        vm.prank(_actor(actorSeed)); // anyone who knows the seed may reveal
+        r.escrow.reveal(id, seed);
+        a = r.escrow.getAcquisition(id);
+        assertEq(uint8(a.status), uint8(FlipEscrow.Status.Resolved));
+        assertEq(a.burned, expectBurn, "burn branch follows the top bit of the random word");
+        assertEq(a.recipient, expectRecipient);
+        assertEq(r.nft.ownerOf(a.tokenId), expectRecipient, "NFT delivered to the resolved recipient");
+        assertEq(r.escrow.openAcquisitionOf(a.tokenId), 0);
+        ghostResolved[id] = true;
+        ghostRecipient[id] = expectRecipient;
+        if (expectBurn) {
+            ghostBurns += 1;
+        } else {
+            ghostAirdrops += 1;
+            _airdroppedTokens.push(a.tokenId);
+        }
+    }
+
+    function revealWrongSeed(uint256 idSeed, bytes32 wrong) external {
+        (uint256 id, FlipEscrow.Acquisition memory a) = _acquisitionIn(idSeed, FlipEscrow.Status.Committed);
+        if (id < 1 || a.status != FlipEscrow.Status.Committed || wrong == seedOf[id]) return;
+        vm.expectRevert(abi.encodeWithSelector(FlipEscrow.WrongSeed.selector, id));
+        r.escrow.reveal(id, wrong);
+    }
+
+    /// Anyone may time a flip out, but only strictly after the commit timeout or the reveal window.
+    function timeoutBurn(uint256 actorSeed, uint256 idSeed) external {
+        (uint256 id, FlipEscrow.Acquisition memory a) = _acquisition(idSeed);
+        if (id < 1) return;
+        uint256 current = vm.getBlockNumber();
+        bool expected;
+        if (a.status == FlipEscrow.Status.Pending) {
+            expected = current > uint256(a.requestBlock) + 7200;
+        } else if (a.status == FlipEscrow.Status.Committed) {
+            expected = current > uint256(a.commitBlock) + 202;
+        }
+        vm.prank(_actor(actorSeed));
+        try r.escrow.timeoutBurn(id) {
+            assertTrue(expected, "timeoutBurn succeeded before the deadline or on a finished flip");
+            assertEq(r.nft.ownerOf(a.tokenId), DEAD, "timed-out NFT is burned");
+            a = r.escrow.getAcquisition(id);
+            assertTrue(a.burned);
+            assertEq(a.recipient, DEAD);
+            ghostResolved[id] = true;
+            ghostRecipient[id] = DEAD;
+            ghostTimeouts += 1;
+        } catch {
+            assertFalse(expected, "timeoutBurn reverted although the deadline passed");
+        }
+    }
+
+    function roll(uint256 blocks) external {
+        vm.roll(vm.getBlockNumber() + bound(blocks, 1, 40));
+    }
+
+    function rollPastCommitTimeout(uint256 gate) external {
+        if (gate % 16 != 0) return; // rare: most runs should resolve by reveal
+        vm.roll(vm.getBlockNumber() + 7201);
+    }
+
+    // ---------------------------------------------------------------- holders
+
+    function enroll(uint256 actorSeed) external {
+        address a = _actor(actorSeed);
+        bool expected =
+            !r.picker.isEnrolled(a) && r.token.balanceOf(a) >= MIN_ENROLL && r.picker.holderCount() < MAX_HOLDERS;
+        vm.prank(a);
+        try r.picker.enroll() {
+            assertTrue(expected, "enroll succeeded for an ineligible caller");
+            assertTrue(r.picker.isEnrolled(a));
+        } catch {
+            assertFalse(expected, "enroll reverted for an eligible caller");
+        }
+    }
+
+    function evict(uint256 actorSeed, uint256 targetSeed) external {
+        address target = _actor(targetSeed);
+        bool expected = r.picker.isEnrolled(target) && r.token.balanceOf(target) < MIN_ENROLL;
+        vm.prank(_actor(actorSeed));
+        try r.picker.evict(target) {
+            assertTrue(expected, "evicted a holder that is still eligible");
+            assertFalse(r.picker.isEnrolled(target));
+        } catch {
+            assertFalse(expected, "could not evict a holder below the minimum");
+        }
+    }
+
+    function transferTokens(uint256 fromSeed, uint256 toSeed, uint256 amount) external {
+        address from = _actor(fromSeed);
+        address to = toSeed % 9 == 0 ? DEAD : _actor(toSeed);
+        uint256 balance = r.token.balanceOf(from);
+        amount = bound(amount, 0, balance);
+        uint256 toBefore = r.token.balanceOf(to);
+        vm.prank(from);
+        r.token.transfer(to, amount);
+        if (from != to) {
+            assertEq(r.token.balanceOf(from), balance - amount);
+            assertEq(r.token.balanceOf(to), toBefore + amount);
+        } else {
+            assertEq(r.token.balanceOf(from), balance);
+        }
+    }
+
+    function snapshot() external {
+        r.picker.snapshot();
+    }
+
+    // ---------------------------------------------------------------- liquidity
+
+    function seedMore(uint256 actorSeed, uint256 ethAmount) external {
+        address a = _actor(actorSeed);
+        ethAmount = bound(ethAmount, 0.001 ether, 0.5 ether);
+        uint256 tokens = r.token.balanceOf(a);
+        if (a.balance < ethAmount || tokens < 1) return;
+        uint128 before = r.forever.totalLiquidity();
+        vm.prank(a);
+        try r.forever.seed{value: ethAmount}(
+            TickMath.MIN_SQRT_PRICE, TickMath.MIN_SQRT_PRICE, TickMath.MAX_SQRT_PRICE, tokens
+        ) returns (
+            uint128 added
+        ) {
+            assertEq(r.forever.totalLiquidity(), before + added, "liquidity only ever grows");
+            ghostLiquidityFloor = r.forever.totalLiquidity();
+        } catch {}
+    }
+}
