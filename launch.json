@@ -1,0 +1,24 @@
+{
+  "kind": "evm_project",
+  "token": {
+    "contract": "LaunchToken",
+    "name": "GOTCHI",
+    "symbol": "GOTCHI",
+    "decimals": 18
+  },
+  "pool": {
+    "pairedCurrency": "0x0000000000000000000000000000000000000000",
+    "fee": 3000,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "contracts": [
+    {"contract": "MockGotchiNFT", "constructorArgs": []},
+    {"contract": "MockBaazaar", "constructorArgs": ["$contract:MockGotchiNFT"]},
+    {"contract": "HolderWeightedPicker", "constructorArgs": ["$token"]},
+    {"contract": "FlipEscrow", "constructorArgs": ["$owner", "$contract:MockGotchiNFT", "$contract:HolderWeightedPicker"]},
+    {"contract": "FeeSink", "constructorArgs": ["$owner", "$contract:MockBaazaar", "$contract:FlipEscrow"]},
+    {"contract": "GotchiHookDeployer", "constructorArgs": ["$owner"]}
+  ],
+  "notes": "Sepolia (11155111) only. Token: LaunchToken (name/symbol GOTCHI, 18 decimals, fixed 1e27 supply minted to the factory, no constructor args, no mint/owner/pause/fee/upgrade). Factory-deployed application contracts, in constructor dependency order: MockGotchiNFT() - permissionless mock ERC721; MockBaazaar(nft) - mock ETH-priced listings with buyCheapest; HolderWeightedPicker(token) - opt-in holder registry (enroll/refresh/evict/trim, MIN_ENROLL_BALANCE 1000 GOTCHI, MAX_HOLDERS 128 with displacement of the smallest weight) whose snapshot weights each holder at min(recorded, live) balance and counts only weight recorded ENROLL_MATURITY_BLOCKS (300) before the purchase block; excludes zero balances and the burn/dead address; FlipEscrow(owner, nft, picker) - Ownable2Step, commit-reveal 50/50 burn-or-airdrop, flipper role defaults to owner; FeeSink(owner, market, escrow) - Ownable2Step, nonReentrant tryBuy at MIN_BUY_THRESHOLD 0.01 ether, pays only listings within [MIN_LIST_PRICE 0.001, MAX_BUY_PRICE 0.05] ether, no withdraw; GotchiHookDeployer(owner) - immutable OWNER, CREATE2-deploys GotchiFeeHook at a mined flag-valid address and wires FeeSink in the same call. Every privileged role is $owner from policy; no wallet is hard-coded and no constructor uses msg.sender for ownership. NOT in this manifest, by design: GotchiFeeHook and ForeverLiquidity. The hook's only constructor argument is the literal PoolManager 0xE03A1074c86CFeDd5C142C4F04F1a1536e203543, but Uniswap v4 reads hook permissions (beforeSwap, afterSwap, beforeSwapReturnDelta, afterSwapReturnDelta) from the low 14 bits of its address and its constructor validates them, so it needs a mined CREATE2 salt that the factory cannot choose; ForeverLiquidity(poolManager, token, hook) depends on the hook address. After launch the owner must: (1) GotchiHookDeployer.findSalt then deploy(salt, PoolManager, FeeSink); (2) deploy ForeverLiquidity(PoolManager, token, hook); (3) FlipEscrow.setFeeSink(FeeSink) and FeeSink.setHook(hook), both one-shot owner-only; (4) seed the hooked forever pool via ForeverLiquidity.seed. Until step 3 the hook charges no fee and the sink buys nothing. The pool fields above describe the factory's own launch pool (native ETH pair, admission fee tier 3000, tickSpacing 60, guarded by the factory's initialization-only PoolInitializationGuard); it opens at the network trading fee and has no swap hook, so the 30 bps FEE_BPS skim into FeeSink applies only to the separate hooked ETH/$GOTCHI forever pool that the owner seeds. Randomness is commit-reveal mock randomness, not VRF; the flipper can withhold a reveal (timeout path documented in README). No initialization calls are required from the factory."
+}
