@@ -9,8 +9,8 @@ independent adversarial review before anything beyond Sepolia.
 | Check | Result |
 | --- | --- |
 | `forge build` (solc 0.8.26, cancun, optimizer 200, `bytecode_hash = none`) | clean; every contract well under 24,576 bytes (largest `ForeverLiquidity` 8,102 B) |
-| `forge test` | 128 passed, 0 failed, 0 skipped (9 suites, fuzz 256 runs); also green under `--isolate` |
-| the four reviewer proofs (registry fill, market fill, partial-fill fee, sink drain) | all pass on this tree |
+| `forge test` | 133 passed, 0 failed, 0 skipped (11 suites, fuzz 256 runs); also green under `--isolate` |
+| the five reviewer proofs (registry fill, market fill, partial-fill fee, sink drain, registry hop) | all pass on this tree |
 | `forge fmt --check` | clean |
 | `EXPECTED_CHAIN_ID=0 forge script script/Deploy.s.sol:Deploy` | runs, mines salt `0x4b76`, prints addresses |
 | `forge lint` (built in to `forge build`) | no `high` findings; remaining: `reentrancy-events` ×8 (low, all in `nonReentrant` or PoolManager-only functions), `calls-loop` ×1 (picker snapshot, by design), `unsafe-typecast` ×14 (int128→uint128 after sign checks, uint→uint96/uint32 via SafeCast or bounded values), `unsafe-oz-erc721-mint` ×1 (mock NFT, intentional), `environment-read-across-mutation` ×4 (tests only) |
@@ -74,6 +74,7 @@ and OZ 5.7. No oracles, no delegatecall, no upgradeability.
 | Finding | Change |
 | --- | --- |
 | Registry captured with 128 dust addresses | `enroll` on a full registry displaces the smallest recorded weight when the caller holds strictly more; the smallest entry is tracked incrementally so a refused enrolment is O(1); `trim` lets anyone lower a stale recorded weight. |
+| Registry displacement compares recorded, not live, weight (one pile hopped through 128 addresses empties the registry) | The constant-gas refusal still compares against the smallest recorded weight, but an accepted displacement now scans the registry once (`_trimAllAndFindWeakest`, ≤128 `balanceOf`, ~1.2M gas cold), trims every stale recorded weight to its live balance, removes the entry with the smallest effective weight `min(recorded, live)` and re-tracks the minimum. A hop address holding 0 is therefore the next victim, so one pile displaces at most one honest entry (`test_onePileHoppedThroughFreshAddressesDisplacesAtMostOneHonestHolder`, `test_hoppedPileCannotMakeAKeeperTheOnlyCandidate`, `test_displacementScanTrimsOtherStaleEntriesAndRetracksLowest`). ABI unchanged. |
 | Market frozen by 64 unaffordable listings | A strictly cheaper listing evicts the most expensive one when the market is full; its NFT returns to its seller. |
 | ETH-specified swaps charged on the request, not the fill | `afterSwap` reverts `PartialFillUnsupported` unless an ETH-specified swap filled completely. v4 offers no way to refund a specified-currency hook delta in `afterSwap`, so refusing is the exact option. |
 | Sink pays any price up to its balance; 1-wei listings | `MAX_BUY_PRICE` ceiling in `FeeSink`; `MIN_LIST_PRICE` floor in both the market and the sink. |
@@ -97,7 +98,10 @@ re-donated fees.
 3. **Hook deployment under a factory.** The hook needs a mined CREATE2 salt; the launch factory path is
    documented as "owner deploys the hook through `GotchiHookDeployer`". Confirm with the launch policy.
 4. **Registry displacement.** A full registry admits whoever holds more than its smallest entry, so a
-   temporary holder can reset a small holder's maturity at the cost of a pool round trip.
+   temporary holder can reset one small holder's maturity per pile of tokens at the cost of a pool
+   round trip. Hopping the same pile evicts the previous hop address, not further holders. Slither was
+   not available on the revision machine; the new scan is `nonReentrant` and reads only the immutable
+   launch token, so it should surface only as another `calls-loop` (low).
 5. **Maturity length.** `ENROLL_MATURITY_BLOCKS = 300` is a judgment call between holder convenience and
    the cost of holding a position to gain odds; confirm it suits the launch.
 6. **Mock market trust.** Fees can be spent on free mints inside the price band; a live integration

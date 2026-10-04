@@ -167,13 +167,19 @@ value. The ETH the sink spends is therefore bounded per purchase, not trusted to
   (cannot enrol). Anyone may `evict` a holder whose balance fell below the minimum.
 - **Bounded, not first-come.** At most 128 enrolled holders, so a snapshot is one bounded transaction.
   When the registry is full, a caller whose balance is strictly larger than the smallest recorded weight
-  displaces that entry, so the registry converges on the 128 largest opted-in holders and dust addresses
-  cannot lock anyone out. Anyone may `trim(holder)` a recorded weight down to the holder's live balance,
-  so a slot cannot be held with tokens that have been sold. A refused enrolment costs constant gas.
+  is admitted (anyone at or below it is refused in constant gas) and displaces the entry with the
+  smallest *effective* weight, `min(recorded, live balance)`. The displacement scans the registry once
+  (at most 128 `balanceOf` reads, about 1.2M gas) and trims every stale recorded weight it passes down
+  to the live balance. The registry therefore converges on the 128 largest opted-in holders, dust
+  addresses cannot lock anyone out, and an address that enrolled and then moved its tokens on is the
+  next entry displaced, not an honest holder. Anyone may also `trim(holder)` a single recorded weight
+  down to the holder's live balance at any time, which lowers the bar the constant-gas test uses.
 - **Residual griefing.** With a full registry, someone who temporarily holds more than the smallest
-  entry can displace it and then sell. The displaced holder can re-enrol once the intruder is trimmed,
-  but their maturity restarts. Each such displacement costs the attacker a pool round trip (two hook
-  fees) and only ever affects the smallest entries of a full registry.
+  entry can displace it and then sell. One pile of tokens displaces at most one entry smaller than
+  itself however many fresh addresses it is hopped through: every later hop evicts the previous hop
+  address, whose live balance is zero. The displaced holder can re-enrol once the intruder's entry is
+  trimmed (or displaced), but their maturity restarts. Each such displacement costs the attacker a pool
+  round trip (two hook fees) per pile and only ever affects the smallest entry of a full registry.
 - **Deterministic.** `pick` maps `word % totalWeight` onto the cumulative table with a binary search.
 - `snapshot()` (no maturity filter) remains available to anyone for inspection; FlipEscrow never uses it.
 
@@ -219,7 +225,7 @@ Test coverage by requirement:
 | threshold / no-buy, price band, reentrancy-safe FeeSink | `FeeSink.t.sol` (malicious re-entering market, catching and bubbling) |
 | cheapest listing, seller payment, NFT transfer, price floor, eviction when full | `MockBaazaar.t.sol` |
 | forced burn / forced airdrop / timeouts / empty snapshot | `FlipEscrow.t.sol` (block hash steered with `vm.setBlockhash`) |
-| deterministic weighted picker, displacement, maturity, trim | `HolderWeightedPicker.t.sol` (fuzz against a linear scan) |
+| deterministic weighted picker, displacement by effective weight (hopped pile, keeper capture), maturity, trim | `HolderWeightedPicker.t.sol` (fuzz against a linear scan) |
 | end-to-end fees → buy → flip with event assertions | `EndToEnd.t.sol` |
 | forever liquidity, price band, refunds, donations, hostile pre-initialization | `ForeverLiquidity.t.sol` |
 | deployment recipe and hook address mining | `Deployment.t.sol` |
@@ -304,7 +310,9 @@ launch pool (with its `PoolInitializationGuard`) is separate from the hooked for
 - **Stray NFTs** sent straight to `FlipEscrow` outside the sink flow are not tracked and stay there.
 - **Airdrop to contracts** uses `transferFrom` (no receiver check) so a recipient that cannot handle
   ERC-721 cannot block resolution; a contract wallet that enrols must be able to move ERC-721s.
-- **Registry displacement griefing** on a full registry costs the attacker pool fees and only resets
-  the maturity of the smallest entries (see holder weighting).
-- Slither 0.11.6 was run on this revision: no high-impact findings; one medium (`reentrancy-no-eth` in
+- **Registry displacement griefing** on a full registry costs the attacker pool fees per pile of tokens
+  and only resets the maturity of the single smallest entry per pile; hopping one pile through fresh
+  addresses evicts the previous hop address, not further holders (see holder weighting).
+- Slither 0.11.6 was run on the previous revision (not available on the machine that made the
+  displacement-scan change): no high-impact findings; one medium (`reentrancy-no-eth` in
   `FlipEscrow.commit`, which is `nonReentrant` and calls only the immutable picker). See `REVIEW.md`.

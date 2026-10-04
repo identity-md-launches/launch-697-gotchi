@@ -24,12 +24,16 @@ import {GotchiConfig} from "./GotchiConfig.sol";
 ///
 /// Capacity: the registry is capped at MAX_HOLDERS so a snapshot is one bounded transaction. The cap is
 /// not first-come: when the registry is full, a caller whose balance is strictly larger than the smallest
-/// recorded weight displaces that entry, so the registry converges on the largest opted-in holders and
-/// filling it with dust addresses locks nobody out. The smallest entry is tracked incrementally, so a
-/// refused enrolment costs a constant amount of gas. A recorded weight cannot be kept above the balance
-/// behind it: anyone may `trim` an entry down to its holder's live balance, which also makes it
-/// displaceable. A displaced holder may enrol again whenever their balance beats the then-smallest
-/// weight (their maturity restarts). No admin role.
+/// recorded weight displaces the entry with the smallest EFFECTIVE weight, `min(recorded, live balance)`,
+/// so the registry converges on the largest opted-in holders and filling it with dust addresses locks
+/// nobody out. The smallest recorded weight is tracked incrementally, so a refused enrolment costs a
+/// constant amount of gas; an accepted displacement scans the registry once (bounded by MAX_HOLDERS),
+/// trimming every stale recorded weight down to its live balance on the way. An address that enrolled
+/// and then moved its tokens on is therefore the next entry displaced, not an honest holder: one pile
+/// of tokens hopped through fresh addresses evicts at most one entry smaller than the pile. A recorded
+/// weight cannot be kept above the balance behind it: anyone may `trim` an entry down to its holder's
+/// live balance, which also makes it displaceable by the constant-gas test. A displaced holder may enrol
+/// again whenever their balance beats the then-smallest weight (their maturity restarts). No admin role.
 contract HolderWeightedPicker is IHolderWeightedPicker, ReentrancyGuard {
     using SafeCast for uint256;
 
@@ -100,7 +104,9 @@ contract HolderWeightedPicker is IHolderWeightedPicker, ReentrancyGuard {
 
     /// @notice Enrol the caller as an airdrop candidate and record their balance as their weight.
     /// Requires MIN_ENROLL_BALANCE. When the registry is full the caller must hold strictly more than the
-    /// smallest current weight, and takes that entry's place.
+    /// smallest recorded weight (constant-gas refusal otherwise), and takes the place of the entry with the
+    /// smallest effective weight `min(recorded, live balance)`, which is found by one bounded scan that
+    /// also trims every stale recorded weight it passes.
     function enroll() external nonReentrant {
         address holder = msg.sender;
         if (holder == BURN_ADDRESS) revert ExcludedAddress(holder);
@@ -108,11 +114,12 @@ contract HolderWeightedPicker is IHolderWeightedPicker, ReentrancyGuard {
         uint256 balance = TOKEN.balanceOf(holder);
         if (balance < MIN_ENROLL_BALANCE) revert BelowMinimumBalance(balance, MIN_ENROLL_BALANCE);
         if (_holders.length >= MAX_HOLDERS) {
-            address smallest = _lowest;
-            uint256 smallestWeight = _registrations[smallest].weight;
-            if (balance <= smallestWeight) revert RegistryFull();
-            _remove(smallest);
-            emit HolderDisplaced(smallest, smallestWeight, holder);
+            if (balance <= _registrations[_lowest].weight) revert RegistryFull();
+            (address weakest, uint256 weakestWeight) = _trimAllAndFindWeakest();
+            _remove(weakest);
+            // trimming may have lowered entries other than the removed one below the tracked minimum
+            _lowest = _findLowest();
+            emit HolderDisplaced(weakest, weakestWeight, holder);
         }
         _holders.push(holder);
         _registrations[holder] = Registration({
@@ -248,6 +255,31 @@ contract HolderWeightedPicker is IHolderWeightedPicker, ReentrancyGuard {
         _holders.pop();
         delete _registrations[holder];
         if (holder == _lowest) _lowest = _findLowest();
+    }
+
+    /// @dev Lower every recorded weight that exceeds its holder's live balance, and return the entry with
+    /// the smallest weight after trimming (first on a tie). One bounded pass of at most MAX_HOLDERS
+    /// `balanceOf` reads; runs only on an accepted displacement, never on a refused enrolment. Because
+    /// every entry is trimmed first, the result is also the entry with the smallest effective weight
+    /// `min(recorded, live)`, so a slot whose tokens have moved on is displaced before any held slot.
+    function _trimAllAndFindWeakest() private returns (address weakest, uint256 weakestWeight) {
+        weakestWeight = type(uint256).max;
+        uint256 count = _holders.length;
+        for (uint256 i = 0; i < count; ++i) {
+            address holder = _holders[i];
+            Registration storage registration = _registrations[holder];
+            uint256 weight = registration.weight;
+            uint256 live = TOKEN.balanceOf(holder);
+            if (live < weight) {
+                weight = live;
+                registration.weight = live.toUint96();
+                emit HolderRefreshed(holder, live, registration.sinceBlock);
+            }
+            if (weight < weakestWeight) {
+                weakestWeight = weight;
+                weakest = holder;
+            }
+        }
     }
 
     /// @dev The enrolled holder with the smallest recorded weight (first on a tie), address(0) if none.

@@ -233,6 +233,146 @@ contract HolderWeightedPickerTest is Test {
         assertFalse(picker.isEnrolled(first));
     }
 
+    /// One pile of tokens hopped through fresh addresses displaces at most one honest entry: every hop after
+    /// the first finds the previous hop address (recorded big, live 0) as the weakest effective entry.
+    function test_onePileHoppedThroughFreshAddressesDisplacesAtMostOneHonestHolder() public {
+        uint256 cap = GotchiConfig.MAX_HOLDERS;
+        uint256 honest = 1_000_000e18;
+        for (uint256 i = 0; i < cap; ++i) {
+            _enroll(address(uint160(0x1000 + i)), honest);
+        }
+        vm.roll(block.number + GotchiConfig.ENROLL_MATURITY_BLOCKS + 1);
+        uint256 purchaseBlock = block.number;
+
+        uint256 pile = honest + 1e18;
+        address hop = address(uint160(0xA000));
+        token.transfer(hop, pile);
+        uint256 maxHopGas = 0;
+        for (uint256 i = 0; i < cap; ++i) {
+            uint256 before = gasleft();
+            vm.prank(hop);
+            picker.enroll();
+            uint256 used = before - gasleft();
+            if (used > maxHopGas) maxHopGas = used;
+            address next = address(uint160(0xA001 + i));
+            vm.prank(hop);
+            token.transfer(next, pile);
+            hop = next;
+        }
+
+        uint256 honestLeft = 0;
+        for (uint256 i = 0; i < cap; ++i) {
+            if (picker.isEnrolled(address(uint160(0x1000 + i)))) honestLeft += 1;
+        }
+        assertEq(honestLeft, cap - 1, "only the first hop displaces an honest holder");
+        assertEq(picker.holderCount(), cap);
+        // only the most recent hop address (recorded the pile, now empty) still holds a slot; it is the
+        // weakest effective entry and goes next. The pile's final holder never enrolled.
+        assertTrue(picker.isEnrolled(address(uint160(0xA000 + cap - 1))));
+        assertFalse(picker.isEnrolled(hop));
+        for (uint256 i = 0; i + 1 < cap; ++i) {
+            assertFalse(picker.isEnrolled(address(uint160(0xA000 + i))));
+        }
+
+        // the flip for an NFT bought before the hops still weights the mature honest holders only
+        uint256 id = picker.snapshotFor(purchaseBlock);
+        HolderWeightedPicker.SnapshotMeta memory meta = picker.snapshotInfo(id);
+        assertEq(meta.entryCount, cap - 1);
+        assertEq(meta.totalWeight, (cap - 1) * honest);
+        assertEq(picker.weightOf(hop, purchaseBlock), 0, "the pile is not mature for this purchase");
+        assertLt(maxHopGas, 2_000_000, "a displacement is one bounded scan");
+    }
+
+    /// Capture variant: a keeper enrolled with slightly more than everyone else cannot become the sole
+    /// weighted entry by hopping a second pile through the registry.
+    function test_hoppedPileCannotMakeAKeeperTheOnlyCandidate() public {
+        uint256 cap = GotchiConfig.MAX_HOLDERS;
+        uint256 honest = 1_000_000e18;
+        address keeper = makeAddr("keeper");
+        _enroll(keeper, honest + 1e18);
+        for (uint256 i = 0; i + 1 < cap; ++i) {
+            _enroll(address(uint160(0x1000 + i)), honest);
+        }
+        vm.roll(block.number + GotchiConfig.ENROLL_MATURITY_BLOCKS + 1);
+        uint256 purchaseBlock = block.number;
+
+        address hop = address(uint160(0xA000));
+        token.transfer(hop, honest + 1e18);
+        for (uint256 i = 0; i + 1 < cap; ++i) {
+            vm.prank(hop);
+            picker.enroll();
+            address next = address(uint160(0xA001 + i));
+            vm.prank(hop);
+            token.transfer(next, honest + 1e18);
+            hop = next;
+        }
+
+        uint256 id = picker.snapshotFor(purchaseBlock);
+        HolderWeightedPicker.SnapshotMeta memory meta = picker.snapshotInfo(id);
+        assertEq(meta.entryCount, cap - 1, "keeper plus the honest holders minus one");
+        assertEq(meta.totalWeight, honest + 1e18 + (cap - 2) * honest);
+        uint256 keeperWins = 0;
+        for (uint256 i = 0; i < 200; ++i) {
+            (address w,) = picker.pick(id, uint256(keccak256(abi.encode("capture", i))));
+            if (w == keeper) keeperWins += 1;
+        }
+        assertLt(keeperWins, 20, "the keeper keeps roughly its 0.8% share, not every airdrop");
+    }
+
+    /// A displacement scan trims every stale entry, not only the one it removes, and the tracked smallest
+    /// recorded weight follows the trimmed entries so the next newcomer is measured against the right bar.
+    function test_displacementScanTrimsOtherStaleEntriesAndRetracksLowest() public {
+        uint256 cap = GotchiConfig.MAX_HOLDERS;
+        address staleEmpty = makeAddr("staleEmpty");
+        address staleHalf = makeAddr("staleHalf");
+        _enroll(staleEmpty, 50 * MIN);
+        _enroll(staleHalf, 50 * MIN);
+        for (uint256 i = 0; i + 2 < cap; ++i) {
+            _enroll(address(uint160(0x2000 + i)), 3 * MIN + i * 1e18);
+        }
+        address honestSmallest = address(uint160(0x2000));
+        assertEq(picker.lowestHolder(), honestSmallest);
+        // both stale entries move tokens away after enrolling; their recorded weights stay at 50 * MIN
+        vm.prank(staleEmpty);
+        token.transfer(carol, 50 * MIN);
+        vm.prank(staleHalf);
+        token.transfer(carol, 48 * MIN);
+
+        // alice beats the smallest recorded weight (3 * MIN); the scan must pick the empty stale entry
+        token.transfer(alice, 4 * MIN);
+        vm.expectEmit(true, false, false, true, address(picker));
+        emit HolderRefreshed(staleEmpty, 0, 1);
+        vm.expectEmit(true, false, false, true, address(picker));
+        emit HolderRefreshed(staleHalf, 2 * MIN, 1);
+        vm.expectEmit(true, true, false, true, address(picker));
+        emit HolderDisplaced(staleEmpty, 0, alice);
+        vm.prank(alice);
+        picker.enroll();
+
+        assertFalse(picker.isEnrolled(staleEmpty));
+        assertTrue(picker.isEnrolled(honestSmallest), "the honest holder keeps its slot");
+        (uint256 halfWeight,) = picker.registrationOf(staleHalf);
+        assertEq(halfWeight, 2 * MIN, "the other stale entry was trimmed in passing");
+        assertEq(picker.lowestHolder(), staleHalf, "the tracked minimum follows the trimmed entry");
+
+        // a newcomer only has to beat the trimmed weight now, and displaces that entry, not an honest one
+        token.transfer(bob, 2 * MIN + 1);
+        vm.expectEmit(true, true, false, true, address(picker));
+        emit HolderDisplaced(staleHalf, 2 * MIN, bob);
+        vm.prank(bob);
+        picker.enroll();
+        assertTrue(picker.isEnrolled(bob));
+        assertTrue(picker.isEnrolled(honestSmallest));
+        assertEq(picker.lowestHolder(), bob);
+
+        // and a caller at or below the smallest recorded weight is still refused in constant gas
+        address dave = makeAddr("dave");
+        token.transfer(dave, 2 * MIN + 1);
+        vm.prank(dave);
+        vm.expectRevert(HolderWeightedPicker.RegistryFull.selector);
+        picker.enroll{gas: 60_000}();
+    }
+
     function test_lowestHolderFollowsEvictionsAndRefreshes() public {
         assertEq(picker.lowestHolder(), address(0));
         _enroll(alice, 3 * MIN);

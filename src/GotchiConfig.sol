@@ -60,8 +60,9 @@ library GotchiConfig {
     uint256 internal constant MIN_ENROLL_BALANCE = 1_000e18;
 
     /// @notice Upper bound on enrolled holders so a snapshot fits comfortably in one transaction.
-    /// @dev When the registry is full a larger holder displaces the smallest entry, so the cap selects
-    /// the largest opted-in holders instead of the first ones.
+    /// @dev When the registry is full a larger holder displaces the entry with the smallest effective
+    /// weight (min of recorded and live balance), so the cap selects the largest opted-in holders instead
+    /// of the first ones. Also bounds the displacement scan (one balanceOf per entry).
     uint256 internal constant MAX_HOLDERS = 128;
 
     /// @notice Blocks a holder's recorded weight must have been in place before an NFT purchase for it
