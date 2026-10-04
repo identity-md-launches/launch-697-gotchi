@@ -53,6 +53,8 @@ contract SystemInvariantTest is GotchiFixture {
             actors
         );
         initialLiquidity = forever.totalLiquidity();
+        // token float the handler hands to registry fillers (never swapped, so ETH accounting is untouched)
+        token.transfer(address(handler), 3_000_000e18);
 
         for (uint256 i = 0; i < actors.length; ++i) {
             ethHolders.push(actors[i]);
@@ -249,13 +251,21 @@ contract SystemInvariantTest is GotchiFixture {
     function invariant_registryAndSnapshotsAreWellFormed() public view {
         uint256 holders = picker.holderCount();
         assertLe(holders, 128, "registry cap");
+        // read the registry once, then sort in memory so the duplicate check costs no external calls
+        address[] memory listed = new address[](holders);
         for (uint256 i = 0; i < holders; ++i) {
             address h = picker.holderAt(i);
             assertTrue(picker.isEnrolled(h), "listed holder not enrolled");
             assertTrue(h != DEAD && h != address(0), "excluded address enrolled");
-            for (uint256 j = i + 1; j < holders; ++j) {
-                assertTrue(picker.holderAt(j) != h, "holder enrolled twice");
+            uint256 j = i;
+            while (j > 0 && listed[j - 1] > h) {
+                listed[j] = listed[j - 1];
+                j -= 1;
             }
+            listed[j] = h;
+        }
+        for (uint256 i = 1; i < holders; ++i) {
+            assertTrue(listed[i - 1] != listed[i], "holder enrolled twice");
         }
         uint256 enrolledActors = 0;
         uint256 minWeight = type(uint256).max;
@@ -263,6 +273,13 @@ contract SystemInvariantTest is GotchiFixture {
             if (!picker.isEnrolled(actors[i])) continue;
             enrolledActors += 1;
             (uint256 w,) = picker.registrationOf(actors[i]);
+            if (w < minWeight) minWeight = w;
+        }
+        address[] memory fillers = handler.fillers();
+        for (uint256 i = 0; i < fillers.length; ++i) {
+            if (!picker.isEnrolled(fillers[i])) continue;
+            enrolledActors += 1;
+            (uint256 w,) = picker.registrationOf(fillers[i]);
             if (w < minWeight) minWeight = w;
         }
         assertEq(enrolledActors, holders, "enrolled flag without a registry slot");
@@ -368,6 +385,24 @@ contract SystemInvariantTest is GotchiFixture {
         handler.transferTokens(0, 9, 1e18); // to the burn address
         handler.transferTokens(2, 1, type(uint256).max);
         handler.evict(0, 2);
+        handler.snapshot();
+
+        // fill the registry, then exercise the displacement scan: a refused newcomer, an admitted one that
+        // removes the smallest filler, a drained filler that the next scan must trim and remove, and an
+        // actor whose balance is far above the bar
+        handler.fillRegistry(0);
+        assertEq(picker.holderCount(), 128, "registry filled");
+        handler.displaceWithFiller(0); // at the bar: RegistryFull (asserted inside)
+        handler.displaceWithFiller(type(uint256).max); // above it: displaces
+        handler.drainFiller(3, 3); // amount % 3 == 0: the filler sells everything
+        handler.trim(1, 5 + 3); // participant index 5 + 3 is filler 3: stale weight trimmed to zero
+        handler.drainFiller(4, 3);
+        handler.displaceWithFiller(type(uint256).max); // the scan trims filler 4 and removes a zero entry
+        handler.enroll(2); // actor 2 was evicted above and now holds nothing: refused
+        handler.evict(1, 5 + 4); // filler 4 holds nothing: evictable by anyone
+        handler.fillRegistry(8); // refills the freed slot
+        assertGe(handler.ghostDisplacements(), 2, "displacement path reached");
+        assertGe(handler.ghostRefusedFull(), 1, "constant-gas refusal reached");
         handler.snapshot();
         handler.seedMore(0, 0.1 ether);
         handler.buyDirect(1, 5);

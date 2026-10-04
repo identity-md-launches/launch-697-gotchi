@@ -566,6 +566,277 @@ contract HolderWeightedPickerEdgeTest is Test {
         assertEq(picker.snapshotInfo(picker.snapshotFor(block.number)).totalWeight, matureSum, "mature total");
     }
 
+    // ---- displacement by effective weight (trim-all scan) ----
+
+    event HolderDisplaced(address indexed holder, uint256 weight, address indexed by);
+    event HolderRefreshed(address indexed holder, uint256 weight, uint256 sinceBlock);
+    event HolderEnrolled(address indexed holder, uint256 balance);
+
+    uint256 internal constant CAP = 128;
+
+    /// @dev Fill the registry with `CAP` fresh holders whose balances are drawn from `seed`.
+    function _fillRegistry(uint256 seed, uint256 spread) internal returns (address[] memory hs, uint256[] memory ws) {
+        hs = new address[](CAP);
+        ws = new uint256[](CAP);
+        for (uint256 i = 0; i < CAP; ++i) {
+            hs[i] = address(uint160(0xD000 + i));
+            ws[i] = MIN + bound(uint256(keccak256(abi.encode(seed, "w", i))), 0, spread);
+            _enroll(hs[i], ws[i]);
+        }
+    }
+
+    /// @dev Effective weight the scan sees: min(recorded, live).
+    function _effective(address h) internal view returns (uint256) {
+        (uint256 w,) = picker.registrationOf(h);
+        uint256 live = token.balanceOf(h);
+        return live < w ? live : w;
+    }
+
+    /// @dev The entry the displacement scan must remove: first registry slot with the smallest effective weight.
+    function _expectedVictim() internal view returns (address victim, uint256 victimWeight) {
+        victimWeight = type(uint256).max;
+        for (uint256 i = 0; i < picker.holderCount(); ++i) {
+            address h = picker.holderAt(i);
+            uint256 eff = _effective(h);
+            if (eff < victimWeight) {
+                victimWeight = eff;
+                victim = h;
+            }
+        }
+    }
+
+    /// A full registry where a random subset of entries has sold some or all of its tokens. A newcomer above
+    /// the smallest recorded weight is admitted; the entry removed is the first one with the smallest
+    /// effective weight, every other stale entry is trimmed (with its maturity untouched), fresh entries
+    /// are untouched, the events come out in registry order, and the tracked minimum is right afterwards.
+    /// forge-config: default.fuzz.runs = 40
+    function testFuzz_displacementWithStaleEntriesEvictsTheWeakestEffectiveAndTrimsTheRest(uint256 seed) public {
+        (address[] memory hs,) = _fillRegistry(seed, 20e18);
+        // some holders move tokens on: a third sell something, of which a third sell everything
+        for (uint256 i = 0; i < CAP; ++i) {
+            uint256 r = uint256(keccak256(abi.encode(seed, "sell", i)));
+            if (r % 3 != 0) continue;
+            uint256 bal = token.balanceOf(hs[i]);
+            uint256 amount = (r >> 8) % 3 == 0 ? bal : bound(r >> 16, 1, bal);
+            vm.prank(hs[i]);
+            token.transfer(address(this), amount);
+        }
+        uint256 minRecorded = _minRecordedWeight();
+        (address victim, uint256 victimWeight) = _expectedVictim();
+        assertLe(victimWeight, minRecorded, "effective minimum above the recorded minimum");
+
+        // record what every entry looks like before the scan, in registry order
+        uint256 n = picker.holderCount();
+        uint256[] memory recordedBefore = new uint256[](n);
+        uint256[] memory liveBefore = new uint256[](n);
+        uint256[] memory sinceBefore = new uint256[](n);
+        address[] memory order = new address[](n);
+        for (uint256 i = 0; i < n; ++i) {
+            order[i] = picker.holderAt(i);
+            (recordedBefore[i], sinceBefore[i]) = picker.registrationOf(order[i]);
+            liveBefore[i] = token.balanceOf(order[i]);
+        }
+
+        address newcomer = makeAddr("newcomer");
+        uint256 balance = minRecorded + bound(uint256(keccak256(abi.encode(seed, "nc"))), 1, 10e18);
+        token.transfer(newcomer, balance);
+        for (uint256 i = 0; i < n; ++i) {
+            if (liveBefore[i] < recordedBefore[i]) {
+                vm.expectEmit(true, false, false, true, address(picker));
+                emit HolderRefreshed(order[i], liveBefore[i], sinceBefore[i]);
+            }
+        }
+        vm.expectEmit(true, true, false, true, address(picker));
+        emit HolderDisplaced(victim, victimWeight, newcomer);
+        vm.expectEmit(true, false, false, true, address(picker));
+        emit HolderEnrolled(newcomer, balance);
+        vm.prank(newcomer);
+        picker.enroll();
+
+        assertFalse(picker.isEnrolled(victim), "the weakest effective entry survived");
+        assertTrue(picker.isEnrolled(newcomer));
+        assertEq(picker.holderCount(), CAP);
+        for (uint256 i = 0; i < n; ++i) {
+            address h = order[i];
+            if (h == victim) continue;
+            (uint256 w, uint256 since) = picker.registrationOf(h);
+            uint256 expected = liveBefore[i] < recordedBefore[i] ? liveBefore[i] : recordedBefore[i];
+            assertEq(w, expected, "survivor not trimmed to min(recorded, live)");
+            assertEq(since, sinceBefore[i], "the scan touched a maturity block");
+            assertLe(w, token.balanceOf(h), "stale weight survived the scan");
+        }
+        address lowest = picker.lowestHolder();
+        assertTrue(picker.isEnrolled(lowest));
+        (uint256 lw,) = picker.registrationOf(lowest);
+        assertEq(lw, _minRecordedWeight(), "tracked minimum wrong after a displacement scan");
+        _assertRegistryConsistent();
+
+        // the scan left no stale weight, so the next refusal bar equals the smallest effective weight
+        (, uint256 nextVictimWeight) = _expectedVictim();
+        assertEq(lw, nextVictimWeight);
+        address late = makeAddr("late");
+        token.transfer(late, lw < MIN ? MIN : lw);
+        vm.prank(late);
+        if ((lw < MIN ? MIN : lw) <= lw) {
+            vm.expectRevert(HolderWeightedPicker.RegistryFull.selector);
+            picker.enroll();
+        } else {
+            picker.enroll();
+            assertEq(picker.holderCount(), CAP);
+        }
+    }
+
+    /// The constant-gas refusal measures the smallest RECORDED weight: entries that sold everything but were
+    /// never trimmed keep the bar where it was, and a newcomer below it must trim one first.
+    function test_untrimmedEmptyEntriesKeepTheRefusalBarUntilSomeoneTrims() public {
+        (address[] memory hs,) = _fillRegistry(1, 0); // every weight exactly MIN
+        for (uint256 i = 0; i < 10; ++i) {
+            vm.prank(hs[i]);
+            token.transfer(address(this), MIN); // ten entries now hold nothing
+        }
+        (address victim, uint256 victimWeight) = _expectedVictim();
+        assertEq(victimWeight, 0);
+        assertEq(victim, hs[0], "first zero entry in registry order");
+        assertEq(_minRecordedWeight(), MIN, "recorded weights are still MIN");
+
+        token.transfer(a, MIN); // equal to the recorded minimum: refused although ten slots are empty
+        vm.prank(a);
+        vm.expectRevert(HolderWeightedPicker.RegistryFull.selector);
+        picker.enroll{gas: 60_000}();
+
+        picker.trim(hs[5]); // anyone trims one of them: the bar drops to zero
+        assertEq(picker.lowestHolder(), hs[5]);
+        vm.prank(a);
+        picker.enroll();
+        // the scan removed the FIRST zero entry, not necessarily the trimmed one, and trimmed the rest
+        assertFalse(picker.isEnrolled(hs[0]));
+        for (uint256 i = 1; i < 10; ++i) {
+            (uint256 w,) = picker.registrationOf(hs[i]);
+            assertEq(w, 0, "empty entry not trimmed by the scan");
+            assertTrue(picker.isEnrolled(hs[i]));
+        }
+        // from here every newcomer at or above MIN is admitted and removes another empty slot: nine more
+        for (uint256 k = 0; k < 9; ++k) {
+            address nc = address(uint160(0xE000 + k));
+            token.transfer(nc, MIN);
+            vm.prank(nc);
+            picker.enroll();
+        }
+        for (uint256 i = 0; i < 10; ++i) {
+            assertFalse(picker.isEnrolled(hs[i]), "an empty slot outlived nine admissions");
+        }
+        for (uint256 i = 10; i < CAP; ++i) {
+            assertTrue(picker.isEnrolled(hs[i]), "a held slot was displaced while empty ones remained");
+        }
+        // and now a MIN newcomer is refused again: nothing left below the bar
+        token.transfer(b, MIN);
+        vm.prank(b);
+        vm.expectRevert(HolderWeightedPicker.RegistryFull.selector);
+        picker.enroll();
+    }
+
+    /// Equal effective weights: the first registry slot goes, and the registry order after swap-and-pop is
+    /// what later ties are measured against.
+    function test_displacementTieOnEffectiveWeightTakesTheFirstRegistrySlot() public {
+        (address[] memory hs,) = _fillRegistry(2, 0);
+        // slot 3 and slot 7 both recorded MIN; slot 7 sells down to MIN - 1, slot 3 sells down to MIN - 1 too
+        vm.prank(hs[3]);
+        token.transfer(address(this), 1);
+        vm.prank(hs[7]);
+        token.transfer(address(this), 1);
+        token.transfer(a, MIN + 1);
+        vm.expectEmit(true, true, false, true, address(picker));
+        emit HolderDisplaced(hs[3], MIN - 1, a);
+        vm.prank(a);
+        picker.enroll();
+        assertTrue(picker.isEnrolled(hs[7]), "the later tie survived");
+        (uint256 w7,) = picker.registrationOf(hs[7]);
+        assertEq(w7, MIN - 1, "the later tie was trimmed");
+        assertEq(picker.lowestHolder(), hs[7]);
+        // swap-and-pop moved the last slot into index 3; the next displacement removes hs[7] (sole minimum)
+        assertEq(picker.holderAt(3), hs[CAP - 1], "last entry moved into the hole");
+        assertEq(picker.holderAt(CAP - 1), a, "newcomer appended at the end");
+        token.transfer(b, MIN);
+        vm.prank(b);
+        picker.enroll();
+        assertFalse(picker.isEnrolled(hs[7]));
+    }
+
+    /// Hopping one pile of tokens through fresh addresses: whatever the pile size and hop count, the honest
+    /// holders (who all still hold their tokens) lose at most one member, that member carried the smallest
+    /// honest weight, and a flip for an NFT bought before the hops still weights exactly the survivors.
+    /// forge-config: default.fuzz.runs = 24
+    function testFuzz_hoppedPileDisplacesAtMostOneHonestHolder(uint256 seed, uint8 hops, uint256 pileSeed) public {
+        (address[] memory hs, uint256[] memory ws) = _fillRegistry(seed, 9 * MIN);
+        uint256 minHonest = type(uint256).max;
+        uint256 honestTotal = 0;
+        for (uint256 i = 0; i < CAP; ++i) {
+            honestTotal += ws[i];
+            if (ws[i] < minHonest) minHonest = ws[i];
+        }
+        vm.roll(block.number + MATURITY + 1);
+        uint256 purchaseBlock = block.number;
+
+        hops = uint8(bound(hops, 1, 40));
+        uint256 pile = bound(pileSeed, minHonest + 1, 30 * MIN);
+        address hop = address(uint160(0xA000));
+        token.transfer(hop, pile);
+        uint256 admitted = 0;
+        for (uint256 i = 0; i < hops; ++i) {
+            uint256 bar = _minRecordedWeight();
+            vm.prank(hop);
+            if (pile <= bar) {
+                vm.expectRevert(HolderWeightedPicker.RegistryFull.selector);
+                picker.enroll();
+                break;
+            }
+            picker.enroll();
+            admitted += 1;
+            address next = address(uint160(0xA001 + i));
+            vm.prank(hop);
+            token.transfer(next, pile);
+            hop = next;
+        }
+
+        uint256 lost = 0;
+        uint256 lostWeight = 0;
+        uint256 survivorWeight = 0;
+        for (uint256 i = 0; i < CAP; ++i) {
+            if (picker.isEnrolled(hs[i])) {
+                survivorWeight += ws[i];
+                (uint256 w,) = picker.registrationOf(hs[i]);
+                assertEq(w, ws[i], "an honest holder was trimmed although it never sold");
+            } else {
+                lost += 1;
+                lostWeight = ws[i];
+            }
+        }
+        assertLe(lost, 1, "one pile displaced more than one honest holder");
+        if (admitted > 0) {
+            assertEq(lost, 1, "the first hop must displace somebody and only honest holders were enrolled");
+            assertEq(lostWeight, minHonest, "the displaced honest holder was not the smallest");
+        }
+        assertEq(picker.holderCount(), CAP);
+        // at most one hop address holds a slot (the last admitted one, now empty)
+        uint256 hopSlots = 0;
+        for (uint256 i = 0; i < 41; ++i) {
+            address h = address(uint160(0xA000 + i));
+            if (picker.isEnrolled(h)) {
+                hopSlots += 1;
+                assertEq(token.balanceOf(h), 0, "an enrolled hop address still holds the pile");
+                assertEq(picker.weightOf(h, type(uint256).max), 0);
+            }
+        }
+        assertEq(hopSlots, admitted > 0 ? 1 : 0, "hop addresses accumulated slots");
+        assertEq(honestTotal - lostWeight, survivorWeight);
+
+        uint256 id = picker.snapshotFor(purchaseBlock);
+        HolderWeightedPicker.SnapshotMeta memory meta = picker.snapshotInfo(id);
+        assertEq(meta.totalWeight, survivorWeight, "flip weight is exactly the honest survivors");
+        assertEq(meta.entryCount, CAP - lost);
+        _assertRegistryConsistent();
+    }
+
     function _minRecordedWeight() internal view returns (uint256 minWeight) {
         minWeight = type(uint256).max;
         for (uint256 i = 0; i < picker.holderCount(); ++i) {

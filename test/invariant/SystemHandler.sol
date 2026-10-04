@@ -64,6 +64,9 @@ contract SystemHandler is Test {
     uint256 public ghostRefusedPartials; // ETH-specified swaps refused at their limit
     uint256 public ghostEvictions; // listings displaced by a cheaper one on a full market
     uint256 public ghostLiquidityFloor; // forever liquidity never drops below this
+    uint256 public ghostDisplacements; // enrolments on a full registry that removed an entry
+    uint256 public ghostRefusedFull; // enrolments refused by the constant-gas RegistryFull test
+    address[] internal _fillers; // registry fillers (small holders) created on demand
     mapping(uint256 acquisitionId => bytes32 seed) public seedOf;
     mapping(uint256 acquisitionId => bool resolved) public ghostResolved;
     mapping(uint256 acquisitionId => address recipient) public ghostRecipient;
@@ -89,6 +92,25 @@ contract SystemHandler is Test {
 
     function _actor(uint256 seed) internal view returns (address) {
         return _actors[seed % _actors.length];
+    }
+
+    /// @notice Every address that may hold a registry slot: the actors plus the fillers created so far.
+    function fillers() external view returns (address[] memory) {
+        return _fillers;
+    }
+
+    /// @dev An actor or a filler: the registry actions target both so displaced, drained and trimmed
+    /// fillers are exercised like actors.
+    function _participant(uint256 seed) internal view returns (address) {
+        uint256 i = seed % (_actors.length + _fillers.length);
+        return i < _actors.length ? _actors[i] : _fillers[i - _actors.length];
+    }
+
+    /// @dev A fresh address funded with `amount` tokens from the handler's float.
+    function _newFiller(uint256 amount) internal returns (address filler) {
+        filler = address(uint160(0xF111_0000 + _fillers.length));
+        _fillers.push(filler);
+        r.token.transfer(filler, amount);
     }
 
     /// @dev One input in four stays in the dust range (edge cases: zero fee, one wei); the rest are sized
@@ -608,11 +630,19 @@ contract SystemHandler is Test {
     // ---------------------------------------------------------------- holders
 
     function enroll(uint256 actorSeed) external {
-        address a = _actor(actorSeed);
+        _enrollAs(_participant(actorSeed));
+    }
+
+    /// @dev Enrolment modelled from first principles: refused when already enrolled, below the minimum,
+    /// or (full registry) at or below the smallest recorded weight; otherwise admitted, and on a full
+    /// registry the first entry with the smallest effective weight leaves and every stale entry is trimmed.
+    function _enrollAs(address a) internal {
         uint256 balance = r.token.balanceOf(a);
         (uint256 lowestWeight,) = r.picker.registrationOf(r.picker.lowestHolder());
-        bool expected = !r.picker.isEnrolled(a) && balance >= MIN_ENROLL
-            && (r.picker.holderCount() < MAX_HOLDERS || balance > lowestWeight);
+        uint256 count = r.picker.holderCount();
+        bool full = count >= MAX_HOLDERS;
+        bool expected = !r.picker.isEnrolled(a) && balance >= MIN_ENROLL && (!full || balance > lowestWeight);
+        (address victim, uint256 victimWeight) = full && expected ? _weakestEffective() : (address(0), 0);
         vm.prank(a);
         try r.picker.enroll() {
             assertTrue(expected, "enroll succeeded for an ineligible caller");
@@ -620,14 +650,87 @@ contract SystemHandler is Test {
             (uint256 weight, uint256 since) = r.picker.registrationOf(a);
             assertEq(weight, balance, "enroll records the live balance");
             assertEq(since, vm.getBlockNumber(), "enroll starts maturity now");
+            if (full) {
+                ghostDisplacements += 1;
+                assertEq(r.picker.holderCount(), MAX_HOLDERS, "displacement changed the count");
+                assertFalse(r.picker.isEnrolled(victim), "the weakest effective entry survived a displacement");
+                assertLt(victimWeight, balance, "displaced an entry at least as heavy as the newcomer");
+                _assertNoStaleWeights();
+            } else {
+                assertEq(r.picker.holderCount(), count + 1);
+            }
         } catch {
             assertFalse(expected, "enroll reverted for an eligible caller");
+            if (full && !r.picker.isEnrolled(a) && balance >= MIN_ENROLL) ghostRefusedFull += 1;
         }
+    }
+
+    /// @dev First registry slot with the smallest min(recorded, live): the entry a displacement must remove.
+    function _weakestEffective() internal view returns (address weakest, uint256 weakestWeight) {
+        weakestWeight = type(uint256).max;
+        uint256 count = r.picker.holderCount();
+        for (uint256 i = 0; i < count; ++i) {
+            address h = r.picker.holderAt(i);
+            (uint256 w,) = r.picker.registrationOf(h);
+            uint256 live = r.token.balanceOf(h);
+            uint256 eff = live < w ? live : w;
+            if (eff < weakestWeight) {
+                weakestWeight = eff;
+                weakest = h;
+            }
+        }
+    }
+
+    /// @dev Right after a displacement scan no recorded weight exceeds its live balance.
+    function _assertNoStaleWeights() internal view {
+        uint256 count = r.picker.holderCount();
+        for (uint256 i = 0; i < count; ++i) {
+            address h = r.picker.holderAt(i);
+            (uint256 w,) = r.picker.registrationOf(h);
+            assertLe(w, r.token.balanceOf(h), "a stale weight survived the displacement scan");
+        }
+    }
+
+    /// Occasionally pack the registry to its cap with small fresh holders, so later enrolments have to
+    /// displace somebody and snapshots run at full size.
+    function fillRegistry(uint256 gate) external {
+        if (gate % 8 != 0) return;
+        uint256 i = 0;
+        while (r.picker.holderCount() < MAX_HOLDERS) {
+            address filler = _newFiller(MIN_ENROLL + (i % 7) * 1e18);
+            _enrollAs(filler);
+            i += 1;
+        }
+    }
+
+    /// A fresh holder sized around the smallest recorded weight tries to enrol: at or below it the
+    /// constant-gas refusal fires, above it the displacement scan runs (modelled in `_enrollAs`).
+    function displaceWithFiller(uint256 amountSeed) external {
+        (uint256 lowestWeight,) = r.picker.registrationOf(r.picker.lowestHolder());
+        uint256 low = lowestWeight > 5e18 ? lowestWeight - 5e18 : 0;
+        uint256 high = lowestWeight + 5e18;
+        if (low < MIN_ENROLL) low = MIN_ENROLL;
+        if (high < low) high = low;
+        if (high > 100 * MIN_ENROLL) high = 100 * MIN_ENROLL; // the float is finite; above this nothing new is learnt
+        if (low > high) low = high;
+        _enrollAs(_newFiller(bound(amountSeed, low, high)));
+    }
+
+    /// A filler moves some or all of its tokens back to the float: its recorded weight goes stale, which
+    /// the next displacement scan (or anyone's `trim`) must correct, and below the minimum it is evictable.
+    function drainFiller(uint256 fillerSeed, uint256 amount) external {
+        if (_fillers.length == 0) return;
+        address filler = _fillers[fillerSeed % _fillers.length];
+        uint256 balance = r.token.balanceOf(filler);
+        amount = amount % 3 == 0 ? balance : bound(amount, 0, balance);
+        vm.prank(filler);
+        r.token.transfer(address(this), amount);
+        assertEq(r.token.balanceOf(filler), balance - amount);
     }
 
     /// Refresh re-records the balance; raising it restarts maturity, lowering it keeps it.
     function refresh(uint256 actorSeed) external {
-        address a = _actor(actorSeed);
+        address a = _participant(actorSeed);
         uint256 balance = r.token.balanceOf(a);
         bool enrolled = r.picker.isEnrolled(a);
         (uint256 weightBefore, uint256 sinceBefore) = r.picker.registrationOf(a);
@@ -645,7 +748,7 @@ contract SystemHandler is Test {
 
     /// Anyone may trim a recorded weight down to the live balance, never up, never touching maturity.
     function trim(uint256 actorSeed, uint256 targetSeed) external {
-        address target = _actor(targetSeed);
+        address target = _participant(targetSeed);
         uint256 balance = r.token.balanceOf(target);
         (uint256 weightBefore, uint256 sinceBefore) = r.picker.registrationOf(target);
         bool expected = r.picker.isEnrolled(target) && balance < weightBefore;
@@ -668,7 +771,7 @@ contract SystemHandler is Test {
     }
 
     function evict(uint256 actorSeed, uint256 targetSeed) external {
-        address target = _actor(targetSeed);
+        address target = _participant(targetSeed);
         bool expected = r.picker.isEnrolled(target) && r.token.balanceOf(target) < MIN_ENROLL;
         vm.prank(_actor(actorSeed));
         try r.picker.evict(target) {
